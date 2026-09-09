@@ -94,7 +94,7 @@ pip install pillow numpy opencv-python httpx pypdf
 
 ```env
 SCAN_REVISION_API_KEY=your-api-key-here
-SCAN_REVISION_BASE_URL=https://api.frimodel.com
+SCAN_REVISION_BASE_URL=https://your-api-base-url.com
 SCAN_REVISION_MODEL=gpt-image-2.5
 ```
 

@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>扫描件文字修订 - 人工框选工具</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1e1e24; color: #e0e0e0; display: flex; height: 100vh; overflow: hidden; }
+  #sidebar { width: 340px; background: #25252d; border-right: 1px solid #383844; padding: 20px; display: flex; flex-direction: column; gap: 16px; z-index: 10; }
+  #sidebar h2 { font-size: 18px; color: #4dabf7; margin-bottom: 4px; }
+  #sidebar p { font-size: 13px; color: #8c8c99; line-height: 1.4; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 12px; font-weight: 600; color: #adb5bd; text-transform: uppercase; }
+  .field input { background: #18181c; border: 1px solid #3d3d4d; border-radius: 6px; padding: 10px; color: #fff; font-size: 14px; }
+  .field input:focus { border-color: #4dabf7; outline: none; }
+  .coords-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .coord-box { background: #18181c; border: 1px solid #3d3d4d; border-radius: 6px; padding: 8px; font-family: monospace; font-size: 13px; }
+  .coord-box span { color: #8c8c99; font-size: 11px; display: block; }
+  #preview-container { border: 1px solid #3d3d4d; border-radius: 6px; background: #18181c; height: 100px; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  #crop-preview { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .btn { background: #1971c2; color: #fff; border: none; border-radius: 6px; padding: 12px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+  .btn:hover { background: #1864ab; }
+  .btn:disabled { background: #495057; cursor: not-allowed; }
+  #main { flex: 1; position: relative; overflow: auto; background: #141416; cursor: crosshair; user-select: none; }
+  #canvas-container { position: relative; display: inline-block; }
+  #doc-img { display: block; max-width: none; }
+  #selection-box { position: absolute; border: 2px solid #ff4d4f; background: rgba(255, 77, 79, 0.18); display: none; pointer-events: none; }
+  .tip-bar { font-size: 12px; color: #faad14; background: rgba(250, 173, 20, 0.1); padding: 8px; border-radius: 4px; border: 1px solid rgba(250, 173, 20, 0.2); }
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <div>
+    <h2>扫描件文字框选</h2>
+    <p>在右侧扫描件上按住鼠标左键并拖拽，框选需要修改的文字区域。</p>
+  </div>
+  <div class="tip-bar">💡 选区尽量紧贴要替换的文字，避免包含多余的表格边框。</div>
+  
+  <div class="field">
+    <label>选区坐标 (像素)</label>
+    <div class="coords-grid">
+      <div class="coord-box"><span>X</span><div id="val-x">-</div></div>
+      <div class="coord-box"><span>Y</span><div id="val-y">-</div></div>
+      <div class="coord-box"><span>宽 (W)</span><div id="val-w">-</div></div>
+      <div class="coord-box"><span>高 (H)</span><div id="val-h">-</div></div>
+    </div>
+  </div>
+
+  <div class="field">
+    <label>选区预览</label>
+    <div id="preview-container">
+      <canvas id="preview-canvas" style="display:none;"></canvas>
+      <img id="crop-preview" alt="选区预览" />
+      <span id="no-preview-text" style="font-size:12px;color:#666;">尚未框选</span>
+    </div>
+  </div>
+
+  <div class="field">
+    <label>替换后文字内容</label>
+    <input type="text" id="replacement-text" placeholder="输入新的文字内容..." />
+  </div>
+
+  <button class="btn" id="submit-btn" disabled>确认并生成修订</button>
+  <button class="btn" id="copy-btn" style="background:#343a40;font-size:13px;" disabled>复制选区参数 (BBox)</button>
+  <div id="status-msg" style="font-size:13px;text-align:center;color:#40c057;"></div>
+</div>
+
+<div id="main">
+  <div id="canvas-container">
+    <img id="doc-img" src="/image" alt="扫描件" />
+    <div id="selection-box"></div>
+  </div>
+</div>
+
+<script>
+  const main = document.getElementById('main');
+  const img = document.getElementById('doc-img');
+  const box = document.getElementById('selection-box');
+  const valX = document.getElementById('val-x');
+  const valY = document.getElementById('val-y');
+  const valW = document.getElementById('val-w');
+  const valH = document.getElementById('val-h');
+  const preview = document.getElementById('crop-preview');
+  const noPreview = document.getElementById('no-preview-text');
+  const replaceInput = document.getElementById('replacement-text');
+  const submitBtn = document.getElementById('submit-btn');
+  const copyBtn = document.getElementById('copy-btn');
+  const statusMsg = document.getElementById('status-msg');
+
+  let isDragging = false;
+  let startX = 0, startY = 0;
+  let curBox = null;
+
+  function getImgScale() {
+    const rect = img.getBoundingClientRect();
+    return {
+      scaleX: img.naturalWidth / rect.width,
+      scaleY: img.naturalHeight / rect.height,
+      rect: rect
+    };
+  }
+
+  img.addEventListener('mousedown', (e) => {
+    isDragging = true;
+    const { scaleX, scaleY, rect } = getImgScale();
+    const clientX = e.clientX - rect.left;
+    const clientY = e.clientY - rect.top;
+    
+    startX = clientX * scaleX;
+    startY = clientY * scaleY;
+    
+    box.style.left = (clientX) + 'px';
+    box.style.top = (clientY) + 'px';
+    box.style.width = '0px';
+    box.style.height = '0px';
+    box.style.display = 'block';
+    e.preventDefault();
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    const { scaleX, scaleY, rect } = getImgScale();
+    const clientX = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
+    const clientY = Math.max(0, Math.min(rect.height, e.clientY - rect.top));
+
+    const curX = clientX * scaleX;
+    const curY = clientY * scaleY;
+
+    const x = Math.max(0, Math.min(startX, curX));
+    const y = Math.max(0, Math.min(startY, curY));
+    const w = Math.min(img.naturalWidth - x, Math.abs(curX - startX));
+    const h = Math.min(img.naturalHeight - y, Math.abs(curY - startY));
+
+    // Display box in client coordinates
+    box.style.left = (x / scaleX) + 'px';
+    box.style.top = (y / scaleY) + 'px';
+    box.style.width = (w / scaleX) + 'px';
+    box.style.height = (h / scaleY) + 'px';
+
+    curBox = { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) };
+    updateDisplay();
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (!isDragging) return;
+    isDragging = false;
+    if (curBox && curBox.w > 4 && curBox.h > 4) {
+      updateCropPreview();
+      validate();
+    }
+  });
+
+  function updateDisplay() {
+    if (!curBox) return;
+    valX.innerText = curBox.x;
+    valY.innerText = curBox.y;
+    valW.innerText = curBox.w;
+    valH.innerText = curBox.h;
+  }
+
+  function updateCropPreview() {
+    if (!curBox || curBox.w <= 0 || curBox.h <= 0) return;
+    const canvas = document.createElement('canvas');
+    canvas.width = curBox.w;
+    canvas.height = curBox.h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, curBox.x, curBox.y, curBox.w, curBox.h, 0, 0, curBox.w, curBox.h);
+    preview.src = canvas.toDataURL();
+    preview.style.display = 'block';
+    noPreview.style.display = 'none';
+  }
+
+  function validate() {
+    const hasBox = curBox && curBox.w > 4 && curBox.h > 4;
+    copyBtn.disabled = !hasBox;
+    submitBtn.disabled = !hasBox || !replaceInput.value.trim();
+  }
+
+  replaceInput.addEventListener('input', validate);
+
+  copyBtn.addEventListener('click', () => {
+    if (!curBox) return;
+    const str = `--bbox ${curBox.x},${curBox.y},${curBox.w},${curBox.h} --text "${replaceInput.value.trim()}"`;
+    navigator.clipboard.writeText(str).then(() => {
+      statusMsg.innerText = "已复制参数到剪贴板！";
+      setTimeout(() => statusMsg.innerText = "", 3000);
+    });
+  });
+
+  submitBtn.addEventListener('click', () => {
+    if (!curBox || !replaceInput.value.trim()) return;
+    submitBtn.disabled = true;
+    submitBtn.innerText = "正在提交...";
+    statusMsg.innerText = "已保存选区，请切换回对话窗口！";
+    
+    fetch('/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        bbox: curBox,
+        text: replaceInput.value.trim()
+      })
+    }).then(r => r.json()).then(data => {
+      submitBtn.innerText = "提交成功 ✓";
+      statusMsg.innerText = "选区已成功提交！后台即将开始渲染。";
+    }).catch(err => {
+      submitBtn.disabled = false;
+      submitBtn.innerText = "重试提交";
+      statusMsg.innerText = "提交出错: " + err;
+    });
+  });
+</script>
+</body>
+</html>
+

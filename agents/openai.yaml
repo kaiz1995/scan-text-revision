@@ -1,0 +1,3 @@
+interface:
+  display_name: "Scan Text Revision"
+  short_description: "Create reviewable scanned-text revision drafts"

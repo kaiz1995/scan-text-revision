@@ -22,4 +22,4 @@ Show original, mask, candidate, and a zoomed comparison. Only explicit approval 
 
 ## Cloud fallback
 
-For complex texture only, send a cropped region and mask through the adapter in cloud-image-adapter.md. Composite the returned patch locally and validate that pixels outside the crop are unchanged. Never send a whole source document by default.
+For complex texture, send a cropped region and mask through the adapter in cloud-image-adapter.md. In test mode, whole-page context may be sent if the owner authorizes it. Composite the returned patch locally and validate that pixels outside the crop are unchanged.

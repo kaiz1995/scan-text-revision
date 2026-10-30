@@ -81,6 +81,60 @@ scan-text-revision/
     └── export_revision.py       # 强制门禁 + 交付组装 + manifest/报告
 ```
 
+## 安装
+
+这个 skill 没有安装脚本、没有构建步骤，安装就是「把仓库目录放到客户端的 skills 目录下」。
+
+> 约定的 skills 目录：Codex 用 `~/.codex/skills/`，ZCode 用 `~/.zcode/skills/`（Windows 下 `~` 展开为 `%USERPROFILE%`）。目录名保持 `scan-text-revision`，与 `SKILL.md` 的 `name` 字段一致。
+
+### 手动安装
+
+macOS / Linux：
+
+```bash
+git clone https://github.com/kaiz1995/scan-text-revision.git ~/.codex/skills/scan-text-revision
+python3 -m pip install pillow numpy
+```
+
+Windows PowerShell：
+
+```powershell
+git clone https://github.com/kaiz1995/scan-text-revision.git "$env:USERPROFILE\.codex\skills\scan-text-revision"
+py -m pip install pillow numpy
+```
+
+没有 git 或不想用 git 时，下载仓库 zip 解压到该目录、把顶层文件夹改名为 `scan-text-revision` 即可。
+
+安装后自检（两条命令都应打印用法，说明代码与被依赖的 Pillow / numpy 都在位）：
+
+```bash
+python ~/.codex/skills/scan-text-revision/scripts/glyph_engine.py --help
+python ~/.codex/skills/scan-text-revision/scripts/qa_gate.py --help
+```
+
+可选依赖按需补装，缺哪个只影响对应功能，不影响基本使用：`opencv-python`（加速）、`pikepdf`（PDF 无损替换）、`httpx`（云端适配器）、Poppler（PDF 栅格化）、`tesseract`（OCR 回读门禁）。
+
+卸载就是删掉那个目录，没有注册表项或配置文件残留。
+
+### 让 agent 安装
+
+把下面这段直接发给能执行命令的 agent（Codex / ZCode 等）：
+
+```text
+请帮我安装 scan-text-revision 这个 skill：
+
+1. 克隆到 skills 根目录：git clone https://github.com/kaiz1995/scan-text-revision.git <skills>/scan-text-revision
+   skills 根目录：Codex 用 ~/.codex/skills，ZCode 用 ~/.zcode/skills；Windows 上展开成 %USERPROFILE%。
+2. 安装必需依赖：python -m pip install pillow numpy（Windows 上 python 若不可用，用 py）。
+3. 自检：分别运行 scripts/glyph_engine.py --help、scripts/qa_gate.py --help、
+   scripts/render_candidates.py --help，三条都要成功。任何一条失败，把完整报错贴出来，
+   不要安装替代品、不要跳过。
+4. 汇报：安装路径、Python 版本、以及 opencv-python / pikepdf / tesseract 是否可用
+   （缺失只影响对应功能，请如实说明缺哪些）。
+```
+
+装完后在对话里用自然语言触发即可，例如「用 scan-text-revision 把这张图上的日期改掉」，agent 会读取 `SKILL.md` 并按其中的流程执行。
+
 ## 环境依赖
 
 ```bash
@@ -209,21 +263,6 @@ python scripts/cloud_inpaint.py crop.png mask.png \
 1. `skipped` 不等于通过。无 tesseract 时 OCR 项记为 `skipped`，不参与放行判定——它不会让门禁失败，也不代表文字已被机器确认可读。同理，源行数字不足 3 个时 `baseline_delta`、没有可比 CJK 时 `cjk_baseline_offset` 也是 `skipped`，同样不算已验证。
 2. 门禁在「找不到可比对的字形」时直接判失败（`glyph metrics: no comparable glyphs ...`），不允许空过。
 3. 是否放行取 `pass` 字段：所有检查无 `fail` 且无额外 `failures` 才是 `true`。
-
-## 实测（一张 4096×3072 的投影照片）
-
-`2026年9月18日 → 2026年10月13日`，`--page-text "9月18日"`：借用了 `1` / `月` / `日`，合成了 `0` / `3`；字体识别为微软雅黑 43.0–43.4 px（NCC 0.95），σ≈1.7，笔画宽与原图 4.00 px 对齐。
-
-```text
-PASS outside_max_diff=0        outside_changed_pixels=0
-PASS boundary_step=0.0         ink_delta=1.85      ink_chroma_delta=2.20
-PASS stroke_delta=0.0          glyph_height_delta=0.0
-PASS baseline_delta=0.69       cjk_baseline_offset=0.38
-PASS noise_ratio=0.82          qtables_equal=True
-SKIP ocr_text                  （本机无 tesseract）
-```
-
-CIELAB ΔE76 相对原行墨色 **1.28**，低于可察觉阈值（约 2.3）。作为对照，把墨色改回「逐通道 99 分位」的版本 ΔE 为 **4.39**（蓝通道 +7.8），肉眼可辨——这正是门禁要同时比亮度与色度的原因：只比亮度时，那个偏白的版本反而得分更好（0.41 vs 1.85）。
 
 ## 「选区外不变」成立在哪一层
 

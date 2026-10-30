@@ -1,4 +1,4 @@
-# Scan Text Revision (扫描件文字修订)
+# Scan Text Revision (扫描件、图片文字高保真修改)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)

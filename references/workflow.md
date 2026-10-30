@@ -16,7 +16,8 @@ Everything the replacement needs is measured from the selected line itself (`gly
 
 - `bg` — per-channel quadratic background surface, least-squares fitted on ink-free pixels only;
 - `alpha` — glyph coverage `clip((L − L_bg) / (L_ink − L_bg), 0, 1)`;
-- `ink_rgb` / `ink_lum` — full ink colour, taken as the **99th percentile** of glyph-core pixels (`alpha > 0.85`, falling back to `0.6`); the median is 5–8 levels darker and makes a rewritten run look lower-contrast;
+- `ink_rgb` / `ink_lum` — full ink colour: a single **vector** sampled at the 90th luminance percentile of the glyph core (`alpha > 0.85`, falling back to `0.6`), so level and hue stay consistent. Per-channel percentiles are wrong here — they pick the componentwise maximum of *different* pixels, which on JPEG 4:2:0 is bluer than anything in the image (measured +15 on B) and makes the rewritten run look too white;
+- `ink_tone` — median luminance of the glyph core: the perceived tone, and what `qa_gate` compares. A rebuilt glyph carries no JPEG ringing at the top end, so a peak statistic would mark the correct render as "darker" and reward an over-bright one;
 - `stroke_px` — median stroke width over glyph components (distance transform median × 2);
 - `baseline_a` / `baseline_b` — robustly trimmed least-squares fit through the dominant glyph-bottom cluster (CJK bottoms overshoot digits by a few px);
 - `sigma_psf` — blur estimate from the steepest alpha 0.5 crossings (`σ = 0.3989 / max|dA/dx|`, clipped to 0.3–4.0);

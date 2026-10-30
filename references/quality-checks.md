@@ -20,14 +20,15 @@ Digits sit on the baseline; CJK glyphs overshoot it by a few px; a slightly tilt
 
 ## Automatic checks
 
-Thresholds come from `qa_gate.THRESHOLDS` and `IMPLEMENTATION-PLAN.md §2`.
+Thresholds come from `qa_gate.THRESHOLDS`.
 
 | Check | Algorithm | Threshold / status |
 | --- | --- | --- |
 | `outside_max_diff` | per-pixel max channel difference outside every declared region | `== 0` |
 | `outside_changed_pixels` | count of changed pixels outside the regions | `== 0` |
 | `boundary_step` | max second-difference excess of column/row means at the four region seams | `< 1.0`; `skipped` when no glyph-free seam rows/columns exist |
-| `ink_delta` | glyph-core 99th-percentile luminance vs intact neighbouring glyphs | `< 3` levels; `skipped` with fewer than 2 glyphs in a window |
+| `ink_delta` | median luminance of the glyph core — perceived tone; the top decile is JPEG ringing, which a rebuilt glyph does not carry, so comparing it rewards over-bright text — vs intact neighbouring glyphs | `< 3` levels; `skipped` with fewer than 2 glyphs in a window |
+| `ink_chroma_delta` | area-weighted ink RGB converted to CIELAB, ΔE76 vs intact neighbouring glyphs | `< 3`; the only check that sees a per-channel colour cast |
 | `stroke_delta` | stroke width (distance-transform median × 2) vs neighbours | `< 0.5 px`; same skip rule |
 | `glyph_height_delta` | max of digit height (new digits vs source digits) and CJK height (shape-matched pairs, bbox height difference) | `< 1 px` |
 | `baseline_delta` | source-digit baseline `a + b·x`, median residual of every new digit's bottom | `< 1 px`; `skipped` without ≥3 source digits and new digits |
@@ -46,7 +47,7 @@ Thresholds come from `qa_gate.THRESHOLDS` and `IMPLEMENTATION-PLAN.md §2`.
 ## What "pixels outside the edit are unchanged" actually covers
 
 - **Lossless PNG layer** (`revised-sample.png`, or `revised-sample.<ext>` for a lossless source): identical to the decoded source outside the declared regions, `outside_max_diff == 0`. This is what the gate measures.
-- **JPEG deliverable** (`revised-sample.jpg`): the source quantisation tables, chroma subsampling, progressive flag and DPI are reused, but unchanged areas still go through one re-quantisation — measured `mean|diff| ≈ 0.000`, worst single channel in the single digits (`IMPLEMENTATION-PLAN.md §1.6` records `max = 6`; the re-check that produced this revision recorded `max = 8`). Do not claim bit-exactness for this file.
+- **JPEG deliverable** (`revised-sample.jpg`): the source quantisation tables, chroma subsampling, progressive flag and DPI are reused, but unchanged areas still go through one re-quantisation — measured `mean|diff| ≈ 0.000`, worst single channel in the 6–8 range depending on the source tables. Do not claim bit-exactness for this file.
 - **PDF**: with `pikepdf`, only the page image XObject is replaced (`DCTDecode`, source tables when present), page size and other objects untouched; without `pikepdf` the export is `lossy_fallback` (Pillow, every page re-encoded at 200 DPI) and the lossless claim does not apply.
 
 All three assume the candidate was rendered from the same file handed to `--source`. Rendering from a re-encoded copy (PNG converted to JPEG, a resized page, a re-saved PDF raster) moves every untouched pixel and `outside_max_diff` fails — correctly.

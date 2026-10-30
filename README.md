@@ -16,7 +16,7 @@
 - **字形借用**：`--page-text` 提供原行文字后，每个字从原图抠出 alpha 遮蔽（按自身连通域裁剪、外扩 6px），平移到目标位置，因此继承原图的模糊、字重和局部噪声。
 - **缺字合成**：识别字体/字号/σ/字重（模板匹配 NCC + 字体 advance 拟合 + 笔画宽校准），4× 超采样渲染后降采样。
 - **背景重建**：选区内的旧墨被「拟合背景面 + 借用洁净区残差噪声」替换；噪声平铺时对齐 8px 的 JPEG 块相位。
-- **强制门禁**：11 项检查（选区外像素 ×2、接缝台阶、满墨色、笔画宽、字高、数字基线、CJK 基线偏移、噪声、量化表、OCR 回读），支持 `pass` / `fail` / `skipped` 三态；字高与基线按「数字对数字、CJK 对同形状 CJK」分类比较。
+- **强制门禁**：12 项检查（选区外像素 ×2、接缝台阶、满墨色亮度、墨色色度 ΔE、笔画宽、字高、数字基线、CJK 基线偏移、噪声、量化表、OCR 回读），支持 `pass` / `fail` / `skipped` 三态；字高与基线按「数字对数字、CJK 对同形状 CJK」分类比较。
 - **编码保真**：JPEG 交付复用源量化表、色度子采样、渐进标志与 DPI；PDF 在有 `pikepdf` 时只替换页面图像 XObject。
 
 ## 它不做什么
@@ -39,7 +39,7 @@
    │    或直接给 x,y,w,h + 原行文字（--page-text）
    ▼
 [候选] render_candidates.py  →  glyph_engine.py
-   │  measure              二次曲面背景 B、alpha 覆盖度、基线、满墨色(核心 99 分位)、笔画宽、σ、噪声
+   │  measure              二次曲面背景 B、alpha 覆盖度、基线、满墨色(高光分位的向量中位色)、笔画宽、σ、噪声
    │  build_glyph_library  --page-text 命中的字 → 连通域裁剪的原始字形遮蔽
    │  render               基线排版；借不到的字用识别字体 4× 超采样合成
    │  compose              out = B + A·(I_ink − B)，仅在掩膜内写回；旧墨由 B+噪声场重建
@@ -75,7 +75,7 @@ scan-text-revision/
     ├── select_box.py            # 本地轻量 Web 服务，承载可视化框选（单框）
     ├── selector.html            # 纯前端 Canvas 单框选区界面
     ├── glyph_engine.py          # 测量 + 字形库 + 基线排版 + 覆盖率合成
-    ├── qa_gate.py               # 11 项门禁（数字/CJK 分类比较）与 pass/fail/skipped 报告
+    ├── qa_gate.py               # 12 项门禁（数字/CJK 分类比较、含 CIELAB 色差）与 pass/fail/skipped 报告
     ├── render_candidates.py     # 生成一个替换候选（默认走 glyph_engine，--legacy 走旧 inpaint）
     ├── cloud_inpaint.py         # 云端 /v1/images/edits 适配器（返回裁剪候选，不回填）
     └── export_revision.py       # 强制门禁 + 交付组装 + manifest/报告
@@ -185,7 +185,7 @@ python scripts/cloud_inpaint.py crop.png mask.png \
 
 ## 质量门禁
 
-`qa_gate.py` 的 `THRESHOLDS` 与 `IMPLEMENTATION-PLAN.md §2` 一一对应：
+`qa_gate.py` 的 `THRESHOLDS` 就是下面这张表：
 
 字高与基线不是「拿新字底边和邻近某个常数比」：门禁先在被粘连的连通域（如 `3`+`日`）的列投影谷值处切开，再按高度双峰（退化时用宽高比）分成数字与 CJK；数字用源行数字拟合出的基线逐字比较，CJK 只和同形状的源 CJK 比墨顶偏移——数字坐在基线上、CJK 会下沉几像素、整行还有轻微倾斜，这三件事必须分开算。
 
@@ -194,7 +194,8 @@ python scripts/cloud_inpaint.py crop.png mask.png \
 | `outside_max_diff` | 与源图逐像素比较，允许区域外的最大通道差 | `== 0` |
 | `outside_changed_pixels` | 允许区域外发生变化的像素数 | `== 0` |
 | `boundary_step` | 接缝处列/行均值的二阶差分增量 | `< 1.0` |
-| `ink_delta` | 字形核心 99 分位亮度，与邻近未改动字比较 | `< 3` 级 |
+| `ink_delta` | 字形核心亮度中位数（感知色调；顶部十分位是 JPEG 振铃，重建字形没有，比它等于奖励"更白"） | `< 3` 级 |
+| `ink_chroma_delta` | 面积加权墨色 RGB 转 CIELAB 后的 ΔE76，与邻近未改动字比较 | `< 3`；色偏的唯一定量防线 |
 | `stroke_delta` | 距离变换中位数 ×2 的笔画宽 | `< 0.5 px` |
 | `glyph_height_delta` | 数字对源行数字、CJK 对同形状 CJK（bbox 高度差）取最大 | `< 1 px` |
 | `baseline_delta` | 用源行数字拟合 `y = a + b·x`，取每个新数字底边残差的中位数 | `< 1 px`；源数字不足 3 个时 `skipped` |
@@ -209,12 +210,27 @@ python scripts/cloud_inpaint.py crop.png mask.png \
 2. 门禁在「找不到可比对的字形」时直接判失败（`glyph metrics: no comparable glyphs ...`），不允许空过。
 3. 是否放行取 `pass` 字段：所有检查无 `fail` 且无额外 `failures` 才是 `true`。
 
+## 实测（一张 4096×3072 的投影照片）
+
+`2026年9月18日 → 2026年10月13日`，`--page-text "9月18日"`：借用了 `1` / `月` / `日`，合成了 `0` / `3`；字体识别为微软雅黑 43.0–43.4 px（NCC 0.95），σ≈1.7，笔画宽与原图 4.00 px 对齐。
+
+```text
+PASS outside_max_diff=0        outside_changed_pixels=0
+PASS boundary_step=0.0         ink_delta=1.85      ink_chroma_delta=2.20
+PASS stroke_delta=0.0          glyph_height_delta=0.0
+PASS baseline_delta=0.69       cjk_baseline_offset=0.38
+PASS noise_ratio=0.82          qtables_equal=True
+SKIP ocr_text                  （本机无 tesseract）
+```
+
+CIELAB ΔE76 相对原行墨色 **1.28**，低于可察觉阈值（约 2.3）。作为对照，把墨色改回「逐通道 99 分位」的版本 ΔE 为 **4.39**（蓝通道 +7.8），肉眼可辨——这正是门禁要同时比亮度与色度的原因：只比亮度时，那个偏白的版本反而得分更好（0.41 vs 1.85）。
+
 ## 「选区外不变」成立在哪一层
 
 旧文档给的是无条件承诺，实际分三种情况：
 
 1. **无损 PNG 层（`revised-sample.png`，或无损源格式的 `revised-sample.<ext>`）**：与源图解码结果逐像素比较，选区外 100% 相同，`outside_max_diff == 0`。这是 `qa_gate` 实际测量的对象，也是唯一可以给出 `max|diff| = 0` 的产物。
-2. **JPEG 交付（`revised-sample.jpg`）**：复用源量化表、子采样、渐进标志和 DPI 重新编码，未改动区域仍会经历一次再量化。实测 `mean|diff| ≈ 0.000`，但最大单通道差是个位数（`IMPLEMENTATION-PLAN.md §1.6` 记录 `max = 6`，本轮复核实测 `max = 8`）。它不是 0，只是肉眼不可见。
+2. **JPEG 交付（`revised-sample.jpg`）**：复用源量化表、子采样、渐进标志和 DPI 重新编码，未改动区域仍会经历一次再量化。实测 `mean|diff| ≈ 0.000`，但最大单通道差是个位数（不同量化表下实测在 6–8 之间）。它不是 0，只是肉眼不可见。
 3. **PDF**：装有 `pikepdf` 时只替换页面图像 XObject，`DCTDecode` 直通，页面尺寸与其余对象不动；**未安装 `pikepdf` 时走 `lossy_fallback`**（Pillow 按 200 DPI 重排整页），无损承诺不适用，manifest 记 `pdf_repack: lossy_fallback`，且源页图像无法解码做像素门禁，除非另给 `--source-pages`。
 
 ## 使用边界与合规

@@ -246,8 +246,9 @@ def _noise_ratio(
 ) -> float | None:
     """High-pass std of the rebuilt background over the intact neighbours' grain.
 
-    Pixels within ``margin`` px of strong ink (source or output) are left out:
-    glyph blur tails are structure, not grain, and would swamp the estimate.
+    Evaluates all pixels inside ``region`` away from the new ink (including
+    positions previously occupied by old ink), while excluding ``margin`` px
+    around new glyphs whose blur tails would swamp the grain estimate.
     """
     x0, y0, x1, y1 = win
     sl = np.s_[y0:y1, x0:x1]
@@ -260,7 +261,7 @@ def _noise_ratio(
     ] = True
     old_ink = _dilate((alpha_src > 0.3).astype(np.float32), max(2, margin // 2), "square") >= 0.5
     new_ink = _dilate((alpha_out > 0.3).astype(np.float32), margin, "square") >= 0.5
-    rebuilt = region_mask & (alpha_src > 0.05) & ~old_ink & ~new_ink
+    rebuilt = region_mask & ~new_ink
     if int(rebuilt.sum()) < 40:
         return None
     ref = (~region_mask) & (alpha_src < 0.02) & ~old_ink
@@ -415,18 +416,18 @@ def _split_wide(
                 continue
             iso = np.zeros_like(alpha)
             iso[oy:oy + bh, ox + a:ox + b] = alpha[oy:oy + bh, ox + a:ox + b]
-            pieces = [p for p in _measure_components(rgb, iso, wx0, wy0) if p["area"] >= 8]
+            pieces = [p for p in _measure_components(rgb, iso, wx0, wy0, int(m.get("polarity", 1)), m.get("bg")) if p["area"] >= 8]
             out.extend(pieces)
     return out
 
 
-def _comp_stats(comps: list[dict]) -> dict | None:
+def _comp_stats(comps: list[dict], min_n: int = 2) -> dict | None:
     """Ink / stroke / height summary of a component set (specks dropped)."""
-    if len(comps) < 2:
+    if len(comps) < min_n:
         return None
     med_h = float(np.median([g["box"][3] for g in comps]))
     keep = [g for g in comps if g["box"][3] >= 0.4 * med_h]
-    if len(keep) < 2:
+    if len(keep) < min_n:
         keep = comps
     areas = np.array([g["area"] for g in keep], np.float64)
     # perceived tone, not the ringing peak: a rebuilt glyph carries smooth ink, so a
@@ -443,14 +444,9 @@ def _comp_stats(comps: list[dict]) -> dict | None:
     }
 
 
-def _fit_digit_baseline(digits: list[dict]) -> tuple[float, float, int] | None:
-    """Least-squares baseline ``y = a + b*x`` through digit bottoms, trimmed.
-
-    Only digits (which sit on the baseline) are used: CJK glyphs overshoot a
-    few px below it and would drag the line down.  Outlier trimming makes the
-    fit robust to a misclassified wide glyph.
-    """
-    pts = [(float(g["cx"]), float(g["bottom"])) for g in digits]
+def _fit_baseline(glyphs: list[dict]) -> tuple[float, float, int] | None:
+    """Robust trimmed baseline ``y = a + b*x`` through glyph bottoms."""
+    pts = [(float(g["cx"]), float(g["bottom"])) for g in glyphs]
     if len(pts) < 3:
         return None
     xs = np.array([p[0] for p in pts])
@@ -459,6 +455,21 @@ def _fit_digit_baseline(digits: list[dict]) -> tuple[float, float, int] | None:
         return None
     b, a = np.polyfit(xs, ys, 1)
     used = np.ones(len(xs), bool)
+    if len(pts) >= 4:
+        slopes = [
+            (ys[j] - ys[i]) / (xs[j] - xs[i])
+            for i in range(len(pts))
+            for j in range(i + 1, len(pts))
+            if abs(xs[j] - xs[i]) > 1.0
+        ]
+        if slopes:
+            b0 = float(np.median(slopes))
+            a0 = float(np.median(ys - b0 * xs))
+            r0 = ys - (a0 + b0 * xs)
+            inliers = np.abs(r0 - float(np.median(r0))) <= 3.0
+            if int(inliers.sum()) >= max(3, int(0.6 * len(pts))):
+                used = inliers
+                b, a = np.polyfit(xs[used], ys[used], 1)
     for _ in range(4):
         r = ys - (a + b * xs)
         centre = float(np.median(r[used]))
@@ -468,6 +479,16 @@ def _fit_digit_baseline(digits: list[dict]) -> tuple[float, float, int] | None:
         used = keep
         b, a = np.polyfit(xs[used], ys[used], 1)
     return float(a), float(b), int(used.sum())
+
+
+def _fit_digit_baseline(digits: list[dict]) -> tuple[float, float, int] | None:
+    """Least-squares baseline ``y = a + b*x`` through digit bottoms, trimmed.
+
+    Only digits (which sit on the baseline) are used: CJK glyphs overshoot a
+    few px below it and would drag the line down.  Outlier trimming makes the
+    fit robust to a misclassified wide glyph.
+    """
+    return _fit_baseline(digits)
 
 
 def _match_shapes(
@@ -542,29 +563,52 @@ def _ocr_available() -> str | None:
     return shutil.which("tesseract")
 
 
-def _ocr_read(image: np.ndarray, bbox: tuple[int, int, int, int], exe: str) -> tuple[str | None, str | None]:
+def _has_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def _ocr_read(
+    image: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    exe: str,
+    expected_text: str = "",
+) -> tuple[str | None, str | None]:
     x0, y0, x1, y1 = bbox
-    pad = 8
     h, w = image.shape[:2]
-    crop = image[max(0, y0 - pad): min(h, y1 + pad), max(0, x0 - pad): min(w, x1 + pad)]
+    crop = image[max(0, y0): min(h, y1), max(0, x0): min(w, x1)]
     if crop.size == 0:
         return None, "empty crop"
-    im = Image.fromarray(crop).convert("L")
+    # Read only the edited region.  Tesseract wants a quiet margin, but taking it
+    # from the page drags neighbour glyphs in ("期" before a date reads as "]"),
+    # so the margin is filled with the region's own border colour instead.
+    gray = np.asarray(Image.fromarray(crop).convert("L"))
+    border = np.concatenate([gray[0], gray[-1], gray[:, 0], gray[:, -1]])
+    pad = 8
+    canvas = np.full((gray.shape[0] + 2 * pad, gray.shape[1] + 2 * pad),
+                     int(np.median(border)), np.uint8)
+    canvas[pad:pad + gray.shape[0], pad:pad + gray.shape[1]] = gray
+    im = Image.fromarray(canvas)
     im = im.resize((im.width * 3, im.height * 3), Image.LANCZOS)
+    needs_cjk = _has_cjk(expected_text)
     with tempfile.TemporaryDirectory() as tmp:
         png = Path(tmp) / "crop.png"
         im.save(png)
-        for lang in ("chi_sim+eng", "eng"):
+        langs = ("chi_sim+eng",) if needs_cjk else ("chi_sim+eng", "eng")
+        for lang in langs:
             try:
                 res = subprocess.run(
                     [exe, str(png), "stdout", "-l", lang, "--psm", "7"],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=60,
                 )
             except (OSError, subprocess.SubprocessError) as exc:
                 return None, f"tesseract failed: {exc}"
             if res.returncode != 0:
+                if needs_cjk:
+                    return None, "未安装 chi_sim 语言包"
                 continue
             return res.stdout.strip(), None
     return None, "tesseract failed for every language pack"
@@ -574,7 +618,7 @@ def _ocr_read(image: np.ndarray, bbox: tuple[int, int, int, int], exe: str) -> t
 # public API
 # --------------------------------------------------------------------------
 def run_gate(source_path: str, output_path: str, edits: list[dict]) -> dict:
-    """Run the eight-metric acceptance gate.
+    """Run the twelve-check acceptance gate.
 
     ``edits`` entries are ``{'bbox': (x, y, w, h), 'expected_text': str,
     'region': (x0, y0, x1, y1)}``; ``bbox`` is where the new text lives,
@@ -652,6 +696,7 @@ def run_gate(source_path: str, output_path: str, edits: list[dict]) -> dict:
     chroma_deltas: list[float] = []
     digit_height_deltas, cjk_height_deltas = [], []
     base_deltas, cjk_base_deltas, noise_ratios = [], [], []
+    cjk_base_skip_reasons: list[str] = []
     for idx, e in enumerate(norm):
         bbox, region = e["bbox"], e["region"]
         # one measurement window covers the whole line in each image
@@ -682,10 +727,11 @@ def run_gate(source_path: str, output_path: str, edits: list[dict]) -> dict:
         src_digits = [g for g in src_pool if g["kind"] == "digit"]
         ref_digits = [g for g in src_digits if not _centre_inside(g, region)]
         src_cjk = [g for g in src_pool if g["kind"] == "cjk"]
+        ref_cjk = [g for g in src_cjk if not _centre_inside(g, region)]
         new_digits = [g for g in new_comps if g["kind"] == "digit"]
         new_cjk = [g for g in new_comps if g["kind"] == "cjk"]
-        stats_new = _comp_stats(new_comps)
-        stats_ref = _comp_stats(ref_comps)
+        stats_new = _comp_stats(new_comps, min_n=1)
+        stats_ref = _comp_stats(ref_comps, min_n=2)
         detail = {
             "index": idx,
             "bbox": list(bbox),
@@ -758,8 +804,9 @@ def run_gate(source_path: str, output_path: str, edits: list[dict]) -> dict:
         if new_cjk and src_cjk:
             pairs = _match_shapes(new_cjk, src_cjk)
             if pairs:
-                if fit:
-                    a, b, _n = fit
+                cjk_fit = fit or _fit_baseline(ref_cjk)
+                if cjk_fit:
+                    a, b, n_cjk_fit = cjk_fit
                     cjk_tops = []
                     for gn, gs in pairs:
                         top_new = float(gn["box"][1]) - (a + b * float(gn["cx"]))
@@ -768,9 +815,19 @@ def run_gate(source_path: str, output_path: str, edits: list[dict]) -> dict:
                     cjk_top = float(np.median(cjk_tops))
                     cjk_base_deltas.append(cjk_top)
                     detail["cjk_baseline_offset"] = round(cjk_top, 3)
+                    detail["cjk_baseline_fit"] = {
+                        "a": round(a, 3),
+                        "b": round(b, 5),
+                        "n_glyphs": n_cjk_fit,
+                        "source": "digit" if fit else "cjk",
+                    }
                     detail["cjk_pairs"] = [
                         {"new": list(gn["box"]), "src": list(gs["box"])} for gn, gs in pairs
                     ]
+                else:
+                    cjk_base_skip_reasons.append(
+                        "no comparable CJK baseline (need >=3 source digits or >=3 unmodified source CJK glyphs)"
+                    )
                 cjk_h = float(
                     np.median(
                         [abs(float(gn["box"][3]) - float(gs["box"][3])) for gn, gs in pairs]
@@ -778,6 +835,10 @@ def run_gate(source_path: str, output_path: str, edits: list[dict]) -> dict:
                 )
                 cjk_height_deltas.append(cjk_h)
                 detail["cjk_height_delta"] = round(cjk_h, 3)
+            else:
+                cjk_base_skip_reasons.append("no shape-matched CJK glyph pair to compare")
+        else:
+            cjk_base_skip_reasons.append("no CJK glyph pair to compare")
         heights = [h for h in (digit_h, cjk_h) if h is not None]
         if heights:
             detail["glyph_height_delta"] = round(max(heights), 3)
@@ -828,9 +889,13 @@ def run_gate(source_path: str, output_path: str, edits: list[dict]) -> dict:
         "baseline_delta", base_deltas, THRESHOLDS["baseline_delta"],
         skip_reason="no comparable digit baseline (need >=3 source digits and new digits)",
     )
+    cjk_skip_reason = next(
+        (r for r in cjk_base_skip_reasons if r != "no CJK glyph pair to compare"),
+        cjk_base_skip_reasons[0] if cjk_base_skip_reasons else "no CJK glyph pair to compare",
+    )
     _add_worst(
         "cjk_baseline_offset", cjk_base_deltas, THRESHOLDS["baseline_delta"],
-        skip_reason="no CJK glyph pair to compare",
+        skip_reason=cjk_skip_reason,
     )
     _add_worst(
         "noise_ratio", noise_ratios, THRESHOLDS["noise_ratio"], cmp="range",
@@ -855,7 +920,7 @@ def run_gate(source_path: str, output_path: str, edits: list[dict]) -> dict:
             e["ocr"] = {"status": "skipped", "reason": "tesseract is not installed"}
     else:
         for e in norm:
-            got, err = _ocr_read(out, e["bbox"], exe)
+            got, err = _ocr_read(out, e["region"], exe, expected_text=e["expected_text"])
             expected = _normalise_text(e["expected_text"])
             if err is not None or got is None:
                 e["ocr"] = {"status": "skipped", "reason": err or "no text read"}

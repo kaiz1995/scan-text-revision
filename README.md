@@ -253,10 +253,10 @@ python scripts/cloud_inpaint.py crop.png mask.png \
 | `stroke_delta` | 距离变换中位数 ×2 的笔画宽 | `< 0.5 px` |
 | `glyph_height_delta` | 数字对源行数字、CJK 对同形状 CJK（bbox 高度差）取最大 | `< 1 px` |
 | `baseline_delta` | 用源行数字拟合 `y = a + b·x`，取每个新数字底边残差的中位数 | `< 1 px`；源数字不足 3 个时 `skipped` |
-| `cjk_baseline_offset` | 新 CJK 与同形状源 CJK 的墨顶，相对同一条拟合基线的偏移 | `< 1 px`；没有同形状 CJK 配对或没有数字基线可依时 `skipped` |
-| `noise_ratio` | 重建区与邻近背景的高频 std 比 | `0.7 ~ 1.4` |
+| `cjk_baseline_offset` | 新 CJK 与同形状源 CJK 的墨顶，相对同一条拟合基线的偏移 | `< 1 px`；基线优先用源行数字拟合，数字不足 3 个时改用至少 3 个未改动源 CJK 字的底边稳健拟合；没有同形状 CJK 配对或两种基线都拟合不出时 `skipped` |
+| `noise_ratio` | 选区内远离新字的全部像素（含旧字原位置）与邻近背景的高频 std 比 | `0.7 ~ 1.4` |
 | `qtables_equal` | 输出 JPEG 量化表 vs 源 | 相等；无损输出且无同级 JPEG 时 `skipped` |
-| `ocr_text` | tesseract 回读 vs `expected_text` | 相等；无 tesseract 时 `skipped` |
+| `ocr_text` | tesseract 回读整个 `region`（新文字比原框长也能读全；只裁 region 本身，四周用它自己的边缘底色补白，不会把相邻的字读进来）vs `expected_text` | 相等；无 tesseract 时 `skipped`；期望文字含汉字而缺 `chi_sim` 语言包时也是 `skipped`，不会用英文包乱读后判失败 |
 
 三条必须如实转述的语义：
 

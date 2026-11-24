@@ -27,15 +27,15 @@ Thresholds come from `qa_gate.THRESHOLDS`.
 | `outside_max_diff` | per-pixel max channel difference outside every declared region | `== 0` |
 | `outside_changed_pixels` | count of changed pixels outside the regions | `== 0` |
 | `boundary_step` | max second-difference excess of column/row means at the four region seams | `< 1.0`; `skipped` when no glyph-free seam rows/columns exist |
-| `ink_delta` | median luminance of the glyph core — perceived tone; the top decile is JPEG ringing, which a rebuilt glyph does not carry, so comparing it rewards over-bright text — vs intact neighbouring glyphs | `< 3` levels; `skipped` with fewer than 2 glyphs in a window |
+| `ink_delta` | median luminance of the glyph core — perceived tone; the top decile is JPEG ringing, which a rebuilt glyph does not carry, so comparing it rewards over-bright text — vs intact neighbouring glyphs | `< 3` levels; needs at least 1 new glyph and 2 intact reference glyphs, otherwise `skipped` |
 | `ink_chroma_delta` | area-weighted ink RGB converted to CIELAB, ΔE76 vs intact neighbouring glyphs | `< 3`; the only check that sees a per-channel colour cast |
 | `stroke_delta` | stroke width (distance-transform median × 2) vs neighbours | `< 0.5 px`; same skip rule |
 | `glyph_height_delta` | max of digit height (new digits vs source digits) and CJK height (shape-matched pairs, bbox height difference) | `< 1 px` |
 | `baseline_delta` | source-digit baseline `a + b·x`, median residual of every new digit's bottom | `< 1 px`; `skipped` without ≥3 source digits and new digits |
-| `cjk_baseline_offset` | new CJK ink-top minus shape-matched source CJK ink-top, both measured from the fitted baseline | `< 1 px`; `skipped` without a shape-matched CJK pair or a digit baseline (never failed for lack of a reference) |
-| `noise_ratio` | high-pass std of the rebuilt background over the neighbouring grain | `0.7 – 1.4` |
+| `cjk_baseline_offset` | new CJK ink-top minus shape-matched source CJK ink-top, both measured from the fitted baseline | `< 1 px`; the baseline is the source-digit fit, or — on a line with fewer than 3 digits — a robust fit through the bottoms of at least 3 unmodified source CJK glyphs; `skipped` without a shape-matched CJK pair or either baseline (never failed for lack of a reference) |
+| `noise_ratio` | high-pass std of every region pixel away from the new ink (old-ink positions included) over the neighbouring grain | `0.7 – 1.4` |
 | `qtables_equal` | output JPEG quantisation tables vs the source's | equal; `skipped` when the source has none, or the output is lossless without a sibling JPEG |
-| `ocr_text` | tesseract read-back of `bbox` vs `expected_text` (spaces stripped) | equal; `skipped` when tesseract is missing or the call fails (`chi_sim+eng`, then `eng`, `--psm 7`); an empty read against a non-empty expectation is a `fail` |
+| `ocr_text` | tesseract read-back of the whole `region` (so a replacement longer than the box is read in full; only the region itself is cropped and padded with its own border colour, so neighbouring glyphs are not read) vs `expected_text` (spaces stripped) | equal; `skipped` when tesseract is missing or the call fails (`chi_sim+eng`, `--psm 7`; the `eng` fallback is used only when `expected_text` has no CJK, so a missing `chi_sim` pack gives `skipped`, not a garbled `fail`); an empty read against a non-empty expectation is a `fail` |
 
 ## How to read the result
 

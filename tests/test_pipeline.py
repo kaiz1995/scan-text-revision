@@ -382,12 +382,13 @@ class PipelineTest(unittest.TestCase):
 
         src_t, out_t = tones(s, None), tones(o, -1)
         self.assertEqual(len(out_t), len(NEW_DATE))
-        by_char: dict[str, list[float]] = {}
-        for ch, v in zip(DATE, src_t):
-            by_char.setdefault(ch, []).append(v)
-        for ch, v in zip(NEW_DATE, out_t):
-            if ch in by_char:
-                self.assertLess(abs(v - float(np.mean(by_char[ch]))), 3.0, ch)
+        self.assertEqual(len(src_t), len(DATE))
+        # an unchanged character is borrowed from the same position of the source, so compare
+        # position by position (two copies of one digit differ by measurement noise already)
+        report = [(i, DATE[i], round(src_t[i], 2), round(out_t[i], 2)) for i in range(len(DATE))]
+        for i, (a, b) in enumerate(zip(DATE, NEW_DATE)):
+            if a == b:
+                self.assertLess(abs(out_t[i] - src_t[i]), 3.0, f"{report}")
 
     def test_default_font_is_found(self) -> None:
         # the synthesis / --legacy fallback font comes from the engine's cross-platform font folders

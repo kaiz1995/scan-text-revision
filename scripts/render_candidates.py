@@ -12,7 +12,7 @@ the line already contains the character.  ``--legacy`` keeps the old
 not fit (textured backgrounds, non-text layouts).
 """
 from __future__ import annotations
-import argparse, json, os, sys
+import argparse, json, sys, unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -50,13 +50,7 @@ def parse_box(value: str) -> tuple[int, int, int, int]:
 
 def fit_font(text: str, box: tuple[int, int, int, int], font_path: str | None):
     _, _, width, height = box
-    if not font_path:
-        font_dir = os.environ.get("WINDIR", r"C:\\Windows") + r"\\Fonts"
-        for name in ("msyh.ttc", "simsun.ttc", "simhei.ttf"):
-            candidate = os.path.join(font_dir, name)
-            if os.path.isfile(candidate):
-                font_path = candidate
-                break
+    font_path = font_path or default_font_path()
     if not font_path: return ImageFont.load_default()
     size = max(8, int(height * 0.82))
     while size >= 8:
@@ -114,52 +108,176 @@ def _ink_list(value):
     if array.size == 1: array = np.repeat(array, 3)
     return [int(round(float(v))) for v in array[:3]]
 
-def segment_boxes(alpha, roi, text):
-    """Split the measured glyph mask into one absolute box per character.
+def _char_weight(ch):
+    """Expected advance of ``ch`` relative to a full-width glyph (1.0)."""
+    code = ord(ch)
+    if code < 0x80:
+        return 0.55 if ch.isalnum() else 0.3          # ASCII digits/latin vs. half-width punctuation
+    if code >= 0x2E80 or unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 1.0                                     # CJK and full-width symbols
+    return 0.55 if ch.isalpha() else 1.0
+
+def _union(a, b):
+    return [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
+
+def _merge_by_width(groups, chars, line_h):
+    """Merge neighbouring groups into one box per character (left/right halves of a character).
+
+    Picks the contiguous partition of the groups into len(chars) segments whose widths best
+    match the expected width of each character (_char_weight * line height).  Digits that merely
+    sit close together are therefore not fused, while wide characters whose strokes split into
+    several pieces are.  Returns the groups unchanged when there are not more groups than
+    characters, or when no partition fits (worst width error above 60 percent).
+    """
+    n, k = len(groups), len(chars)
+    if k == 0 or n <= k: return groups
+    def err(i, j, c):
+        expected = _char_weight(c) * line_h
+        return abs(groups[j - 1][2] - groups[i][0] - expected) / expected
+    inf = float('inf')
+    best = [[inf] * (n + 1) for _ in range(k + 1)]
+    back = [[0] * (n + 1) for _ in range(k + 1)]
+    best[0][0] = 0.0
+    for c in range(1, k + 1):
+        for j in range(c, n - (k - c) + 1):
+            for i in range(c - 1, j):
+                if best[c - 1][i] == inf: continue
+                cost = best[c - 1][i] + err(i, j, chars[c - 1]) ** 2
+                if cost < best[c][j]: best[c][j], back[c][j] = cost, i
+    if best[k][n] == inf: return groups
+    cuts, j = [], n
+    for c in range(k, 0, -1):
+        i = back[c][j]
+        cuts.append((i, j))
+        j = i
+    cuts.reverse()
+    if max(err(i, j, ch) for (i, j), ch in zip(cuts, chars)) > 0.6: return groups
+    merged = []
+    for i, j in cuts:
+        g = groups[i]
+        for h in groups[i + 1:j]: g = _union(g, h)
+        merged.append(list(g))
+    return merged
+
+def _split_wide(groups, mask, count, line_h):
+    """Split stuck-together glyphs (数字和汉字粘连, 如 3日) at the column-projection valley.
+
+    Only runs while there are fewer groups than characters and only touches
+    groups wider than 1.3 line heights.
+    """
+    while len(groups) < count:
+        wide = [i for i, g in enumerate(groups) if g[2] - g[0] > 1.3 * line_h]
+        if not wide: return
+        i = max(wide, key=lambda k: groups[k][2] - groups[k][0])
+        g = groups[i]
+        piece = max(2, int(round(0.25 * line_h)))
+        lo, hi = g[0] + piece, g[2] - piece
+        if hi <= lo: return
+        proj = mask[g[1]:g[3], g[0]:g[2]].sum(axis=0).astype(np.float64)
+        smooth = np.convolve(proj, np.ones(3) / 3.0, mode="same")
+        window = smooth[lo - g[0]:hi - g[0]]
+        ties = np.flatnonzero(window <= window.min() + 1e-9)
+        cut = lo + int(ties[len(ties) // 2])
+        pieces = []
+        for a, b in ((g[0], cut), (cut, g[2])):
+            sub = mask[g[1]:g[3], a:b]
+            ys, xs = np.nonzero(sub)
+            if len(xs) == 0: continue
+            pieces.append([a + int(xs.min()), g[1] + int(ys.min()), a + int(xs.max()) + 1, g[1] + int(ys.max()) + 1])
+        if len(pieces) < 2: return
+        groups[i:i + 1] = pieces
+
+def segment_line(alpha, roi, text, engine=None):
+    """Split the measured glyph mask into one absolute box per non-blank character.
 
     ``measure`` returns connected components without character labels, so the
-    caller pairs them with ``--page-text``.  Components are grouped by
-    horizontal overlap (日/月 consist of several components) and, if the count
-    still disagrees with the text, the ink span is split evenly as a last
-    resort.  Returns ``(x, y, width, height)`` boxes in absolute pixels.
-    """
-    x0, y0, x1, y1 = roi
-    mask = (alpha > 0.5).astype(np.uint8)
-    groups = []
-    try:
-        import cv2
-        count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        components = sorted((stats[i, 0], stats[i, 1], stats[i, 2], stats[i, 3])
-                            for i in range(1, count) if stats[i, 4] >= 8)
-        for cx, cy, cw, ch in components:
-            for group in groups:
-                if cx <= group[2]:  # overlapping the current group horizontally
-                    group[0], group[1] = min(group[0], cx), min(group[1], cy)
-                    group[2], group[3] = max(group[2], cx + cw), max(group[3], cy + ch)
-                    break
-            else:
-                groups.append([cx, cy, cx + cw, cy + ch])
-    except ImportError:
-        groups = []
-    if len(groups) == len(text):
-        return [(x0 + g[0], y0 + g[1], g[2] - g[0], g[3] - g[1]) for g in groups]
-    rows, cols = np.where(mask > 0)
-    if len(cols) < 4: return []
-    x_min, x_max, y_min, y_max = cols.min(), cols.max() + 1, rows.min(), rows.max() + 1
-    edges = np.linspace(x_min, x_max, len(text) + 1)
-    return [(x0 + edges[i], y0 + y_min, edges[i + 1] - edges[i], y_max - y_min) for i in range(len(text))]
+    caller pairs them with the original line text.  Whitespace never takes part
+    in the pairing (there is no ink for it).  Components are grouped by
+    horizontal overlap (日/月 consist of several components), halves of
+    left/right characters are merged and stuck glyphs are split at the column
+    valley.  If the count still disagrees, the ink span is divided in proportion
+    to the expected character widths.
 
-def borrow_boxes(metrics, page_text):
-    """Build ``(char, x, y, w, h)`` entries for build_glyph_library."""
-    if not page_text: return [], "no --page-text, every glyph is synthesized"
+    Returns ``(boxes, mode)``; ``boxes`` are ``(x, y, width, height)`` in
+    absolute pixels, one per non-whitespace character of ``text`` and in the
+    same order; ``mode`` is ``"components"``, ``"proportional_fallback"`` or
+    ``"none"`` (no ink / nothing to pair, ``boxes`` empty).
+    """
+    x0, y0 = roi[0], roi[1]
+    chars = [c for c in text if not c.isspace()]
+    count = len(chars)
+    mask = np.asarray(alpha) > 0.5
+    if count == 0 or not mask.any(): return [], "none"
+    engine = engine or load_engine()
+    n_comp, _labels, stats = engine._components(mask)
+    comps = sorted((int(s[0]), int(s[1]), int(s[2]), int(s[3])) for s in stats[1:n_comp] if int(s[4]) >= 8)
+    groups = []
+    for cx, cy, cw, ch in comps:
+        if groups and cx <= groups[-1][2]:   # overlapping/touching the previous group horizontally
+            groups[-1] = _union(groups[-1], [cx, cy, cx + cw, cy + ch])
+        else:
+            groups.append([cx, cy, cx + cw, cy + ch])
+    if groups:
+        line_h = max(g[3] - g[1] for g in groups)
+        groups = _merge_by_width(groups, chars, line_h)
+        _split_wide(groups, mask, count, line_h)
+    if groups and len(groups) == count:
+        return [(x0 + g[0], y0 + g[1], g[2] - g[0], g[3] - g[1]) for g in groups], "components"
+    rows, cols = np.where(mask)
+    if len(cols) < 4: return [], "none"
+    x_min, x_max, y_min, y_max = int(cols.min()), int(cols.max()) + 1, int(rows.min()), int(rows.max()) + 1
+    weights = np.array([_char_weight(c) for c in chars], np.float64)
+    edges = x_min + (x_max - x_min) * np.concatenate(([0.0], np.cumsum(weights))) / weights.sum()
+    return [(x0 + float(edges[i]), y0 + y_min, float(edges[i + 1] - edges[i]), y_max - y_min)
+            for i in range(count)], "proportional_fallback"
+
+def segment_boxes(alpha, roi, text, engine=None):
+    """Boxes only (see :func:`segment_line`); one per non-whitespace character."""
+    return segment_line(alpha, roi, text, engine)[0]
+
+def borrow_boxes(metrics, page_text, engine=None):
+    """Build ``(char, x, y, w, h)`` entries for build_glyph_library.
+
+    Returns ``(entries, note, segmentation)``; whitespace characters of
+    ``page_text`` are skipped and the remaining ones are mapped back to their boxes.
+    """
+    if not page_text: return [], "no --page-text, every glyph is synthesized", "none"
     alpha = _alpha_array(metrics)
     roi = tuple(metrics.get("box") or ())
-    if alpha is None or len(roi) != 4: return [], "measure() returned no alpha map; every glyph is synthesized"
-    boxes = segment_boxes(alpha, roi, page_text)
-    if len(boxes) != len(page_text):
-        return [], "page glyphs could not be located; every glyph is synthesized"
-    return [(char, x, y, w, h) for char, (x, y, w, h) in zip(page_text, boxes)], \
-           "borrowed from the measured page glyphs"
+    if alpha is None or len(roi) != 4:
+        return [], "measure() returned no alpha map; every glyph is synthesized", "none"
+    chars = [c for c in page_text if not c.isspace()]
+    boxes, mode = segment_line(alpha, roi, page_text, engine)
+    if len(boxes) != len(chars) or not boxes:
+        return [], "page glyphs could not be located; every glyph is synthesized", "none"
+    note = "borrowed from the measured page glyphs"
+    if mode == "proportional_fallback":
+        note = "borrowed from width-proportional estimates (connected components did not match --page-text)"
+    return [(char, x, y, w, h) for char, (x, y, w, h) in zip(chars, boxes)], note, mode
+
+def line_left_pen(engine, tight, metrics, first_char, font_path):
+    """Pen x that puts a synthesized first glyph at the original line's left ink edge."""
+    lefts = [int(g["box"][0]) for g in tight.get("glyphs") or [] if g.get("box") and g.get("area", 8) >= 8]
+    if not lefts: return None
+    left = float(min(lefts))
+    path = font_path or metrics.get("font_path")
+    size = metrics.get("font_size")
+    renderer = getattr(engine, "_render_glyph", None)
+    if path and size and callable(renderer):
+        # PIL's getbbox() starts at the pen origin, not at the ink (a "1" has ~8 px of side bearing),
+        # so measure where the ink of the rendered glyph really starts relative to the pen.
+        try:
+            sigma = float(metrics.get("font_sigma", metrics.get("sigma", 1.0)) or 0.0)
+            weight = float(metrics.get("font_weight_px", 0.0) or 0.0)
+            glyph = renderer(first_char, path, float(size), sigma, weight)
+            # same 0.5 coverage edge that measure() uses for the original line's ink box
+            cols = np.where((np.asarray(glyph) > 0.5).any(axis=0))[0]
+            if len(cols):
+                canvas = int(np.ceil(float(size) * getattr(engine, "RENDER_EM", 3.2)))
+                canvas += canvas % 2
+                left -= float(cols.min()) - canvas / 2.0
+        except Exception: pass
+    return left
 
 
 def baseline_from_digits(boxes):
@@ -199,11 +317,12 @@ def identify_font(engine, metrics, library, font_path=None):
             "advance_rmse": metrics.get("font_advance_rmse")}
 
 def default_font_path():
-    font_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    """A CJK font from the engine's font folders (Windows, macOS, Linux), msyh/simsun/simhei first."""
+    found = load_engine()._font_candidates()
+    by_name = {Path(p).name.lower(): p for p in found}
     for name in ("msyh.ttc", "simsun.ttc", "simhei.ttf"):
-        candidate = font_dir / name
-        if candidate.is_file(): return str(candidate)
-    return None
+        if name in by_name: return by_name[name]
+    return found[0] if found else None
 
 def preset_font(metrics, height_source, box, font_path):
     """Without page glyphs the engine cannot identify a font, so seed it here."""
@@ -214,29 +333,56 @@ def preset_font(metrics, height_source, box, font_path):
     metrics["font_path"] = path
     metrics["font_size"] = max(8.0, size)
     metrics["font_sigma"] = float(metrics.get("sigma") or 1.0)
-    metrics["font_weight_px"] = float(metrics.get("weight") or 0.0)
+    metrics["font_weight_px"] = float(metrics.get("font_weight_px") or 0.0)
     return path
 
 
 # --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
-def render_engine(image, box, text, engine, page_text, font_path, sigma, weight, want_font_id):
+def remeasure_with_margin(engine, image, tight, edition, margin):
+    """Measure the selected box plus ``margin`` px, or None when that window is unusable.
+
+    The selected line's polarity is kept.  The window is rejected when the margin
+    reaches paper of another tone (light text on a dark band): the background fitted
+    inside the box then drifts, or a border row/column is almost all "ink", which no
+    neighbouring text produces but a strip of differently toned paper does.
+    """
+    x0, y0, x1, y1 = edition
+    box = (max(0, x0 - margin), max(0, y0 - margin), min(image.width, x1 + margin), min(image.height, y1 + margin))
+    if box == edition: return None
+    try: wide = engine.measure(image, box, polarity=tight["polarity"])
+    except ValueError: return None
+    bx, by = x0 - int(wide["box"][0]), y0 - int(wide["box"][1])
+    inner = np.asarray(wide["lum_bg"])[by:by + y1 - y0, bx:bx + x1 - x0]
+    if abs(float(np.median(inner)) - float(np.median(tight["lum_bg"]))) > float(getattr(engine, "ROUGH_THRESHOLD", 10.0)):
+        return None
+    ink = np.asarray(wide["alpha"]) > 0.5
+    ring_rows = [r for r in range(ink.shape[0]) if r < by or r >= by + y1 - y0]
+    ring_cols = [c for c in range(ink.shape[1]) if c < bx or c >= bx + x1 - x0]
+    if any(ink[r].mean() > 0.8 for r in ring_rows) or any(ink[:, c].mean() > 0.8 for c in ring_cols):
+        return None
+    return wide
+
+def render_engine(image, box, text, engine, page_text, font_path, sigma, weight, want_font_id, pen_x=None):
     image = image.convert("RGB")
     x, y, width, height = box
     # 1. Measure the selected line to locate its glyphs (character boxes).
     tight = engine.measure(image, (x, y, x + width, y + height))
     edition = tuple(int(v) for v in tight["box"])
-    boxes, source_note = borrow_boxes(tight, page_text)
-    digit_baseline = baseline_from_digits(boxes)
+    boxes, source_note, segmentation = borrow_boxes(tight, page_text, engine)
+    # boxes cut by width proportion are not real glyph extents: do not fit a baseline on them
+    digit_baseline = baseline_from_digits(boxes) if segmentation == "components" else None
     # 2. Re-measure with a margin: render() keeps borrowed mattes (which carry
     #    PAD pixels of context) inside the measured box, and the first glyph can
     #    sit a few px left of its ink origin.  The margin gives that slack; the
     #    background is still erased only inside the selected box below.
-    margin = 24
-    expanded = (max(0, edition[0] - margin), max(0, edition[1] - margin),
-                min(image.width, edition[2] + margin), min(image.height, edition[3] + margin))
-    metrics = engine.measure(image, expanded) if expanded != edition else tight
+    metrics, expanded = tight, edition
+    for margin in (24, 12, 6, 3):
+        wide = remeasure_with_margin(engine, image, tight, edition, margin)
+        if wide is not None:
+            metrics, expanded = wide, tuple(int(v) for v in wide["box"])
+            break
     if digit_baseline:
         # digits anchor the baseline; CJK bottoms overshoot it
         metrics["baseline_a"], metrics["baseline_b"], metrics["baseline_x0"] = digit_baseline
@@ -246,23 +392,42 @@ def render_engine(image, box, text, engine, page_text, font_path, sigma, weight,
         for key in ("baseline_a", "baseline_b", "baseline_x0"):
             if tight.get(key) is not None: metrics[key] = tight[key]
     x0, y0, x1, y1 = (int(v) for v in metrics["box"])
-    library = engine.build_glyph_library(image, metrics, boxes) if boxes else {}
+    # which source glyphs had a blank after them: the engine decides per placed instance
+    # whether its measured advance already covers a blank of the new text
+    space_after = [i + 1 < len(page_text) and page_text[i + 1].isspace()
+                   for i, ch in enumerate(page_text or "") if not ch.isspace()]
+    library = engine.build_glyph_library(image, metrics, boxes, space_after=space_after) if boxes else {}
     if not isinstance(library, dict): library = dict(library)
+    render_text = text.strip()
+    if not render_text: raise ValueError("text must not be empty")
     borrowed = [char for char in dict.fromkeys(text) if library.get(char)]
-    synthesized = [char for char in dict.fromkeys(text) if not library.get(char)]
+    synthesized = [char for char in dict.fromkeys(text) if not char.isspace() and not library.get(char)]
+    if page_text and segmentation == "proportional_fallback":
+        print("render_candidates: warning: connected components do not match --page-text; "
+              "fell back to width-proportional glyph splitting, borrowed glyphs may be misaligned", file=sys.stderr)
+    if page_text and not borrowed:
+        print(f"render_candidates: warning: no original glyph could be borrowed ({source_note}); "
+              "every glyph is synthesized from the font", file=sys.stderr)
     if not library and synthesized and not preset_font(metrics, tight, box, font_path):
         print("render_candidates: no CJK font found to synthesise with; pass --font", file=sys.stderr)
     font_id = None
-    if font_path or synthesized or want_font_id or sigma is not None or weight is not None:
+    if synthesized or want_font_id:
         font_id = identify_font(engine, metrics, library, font_path)
         if font_id and not font_path: font_path = font_id["path"]
     if sigma is not None:
         metrics["sigma"] = metrics["font_sigma"] = float(sigma)
         metrics["sigma_source"] = "override"
     if weight is not None:
-        metrics["weight"] = metrics["font_weight_px"] = float(weight)
+        metrics["font_weight_px"] = float(weight)
+    if pen_x is None and not library.get(render_text[0]):
+        # first glyph is synthesized: the engine would anchor it at the (margin-expanded)
+        # measure; use the selected line's own left ink edge instead.
+        pen_x = line_left_pen(engine, tight, metrics, render_text[0], font_path)
 
-    patch, ink_rgb = engine.render(text, metrics, library, font_path=font_path, pen_x=float(edition[0]))
+    # a given or identified font is always passed: the engine may need it for blanks and for
+    # borrowed glyphs whose source advance does not fit the new text
+    patch, ink_rgb = engine.render(render_text, metrics, library, font_path=font_path,
+                                   pen_x=None if pen_x is None else float(pen_x))
     patch = np.asarray(patch, np.float32)
     if patch.ndim > 2: patch = patch[..., 0]
 
@@ -279,14 +444,20 @@ def render_engine(image, box, text, engine, page_text, font_path, sigma, weight,
     mask[ey0:ey1, ex0:ex1] = 255
     rows, cols = np.where(patch > 0.02)
     if len(rows):
-        ay0, ay1 = max(0, y0 + int(rows.min())), min(height_px, y0 + int(rows.max()) + 1)
-        ax0, ax1 = max(0, x0 + int(cols.min())), min(width_px, x0 + int(cols.max()) + 1)
+        # Grow the mask only right/down (longer text).  Left/top stay inside the selected box: a faint
+        # matte tail one px left of it would rewrite the neighbouring glyph's blurred edge and show up
+        # as a seam step in the QA gate.
+        ay0, ay1 = max(ey0, y0 + int(rows.min())), min(height_px, y0 + int(rows.max()) + 1)
+        ax0, ax1 = max(ex0, x0 + int(cols.min())), min(width_px, x0 + int(cols.max()) + 1)
         mask[ay0:ay1, ax0:ax1] = 255
     ink_noise = None
     if hasattr(engine, "noise_field"):
         try: ink_noise = engine.noise_field(metrics, patch.shape[:2])
         except Exception: ink_noise = None
-    composed = engine.compose(base, patch, ink_rgb, float(x0), float(y0), mask=mask, ink_noise=ink_noise)
+    # per-glyph ink (patch shaped) when the engine provides it, else the single colour
+    ink_field = metrics.get("ink_field")
+    ink_for_compose = ink_field if ink_field is not None and np.asarray(ink_field).shape[:2] == patch.shape[:2] else ink_rgb
+    composed = engine.compose(base, patch, ink_for_compose, float(x0), float(y0), mask=mask, ink_noise=ink_noise)
     result = _result_image(composed)
     if result.size != image.size: raise ValueError("compose() returned an image with changed dimensions")
     before, after = np.asarray(image), np.asarray(result)
@@ -297,6 +468,8 @@ def render_engine(image, box, text, engine, page_text, font_path, sigma, weight,
     info = {
         "mode": "glyph_engine",
         "glyph_source": source_note,
+        "segmentation": segmentation,
+        "pen_x": None if pen_x is None else round(float(pen_x), 3),
         "glyphs_borrowed": borrowed,
         "glyphs_synthesized": synthesized,
         "sigma": round(float(metrics.get("sigma_psf", metrics.get("sigma", 0.0)) or 0.0), 3),
@@ -307,10 +480,11 @@ def render_engine(image, box, text, engine, page_text, font_path, sigma, weight,
                      "b": round(float(metrics.get("baseline_b", 0.0)), 5),
                      "x0": round(float(metrics.get("baseline_x0", x0)), 3)},
         "roi": [x0, y0, x1, y1],
-        "font": font_path or metrics.get("font_path"),
+        "font": metrics.get("font_path") or font_path,
         "page_text": page_text,
         "measurement": {
             "glyph_components": len(metrics.get("glyphs") or []),
+            "polarity": metrics.get("polarity"),
             "noise_std": [round(float(v), 3) for v in np.asarray(metrics.get("noise_std", [0, 0, 0])).ravel()[:3]],
             "font_size": metrics.get("font_size"),
             "font_weight_px": metrics.get("font_weight_px"),
@@ -340,6 +514,7 @@ def main() -> int:
     parser.add_argument("--font-id", action="store_true", help="identify the page typeface by template matching")
     parser.add_argument("--sigma", type=float, help="override the measured/render blur sigma")
     parser.add_argument("--weight", type=float, help="override the glyph stroke-weight calibration (px)")
+    parser.add_argument("--pen-x", type=float, help="absolute x of the first new glyph's pen origin; default: align with the original first glyph")
     parser.add_argument("--legacy", action="store_true", help="use the old inpaint block repaint instead of glyph_engine")
     args = parser.parse_args()
     if not args.input.is_file(): parser.error(f"input is not a file: {args.input}")
@@ -355,7 +530,7 @@ def main() -> int:
         engine = load_engine()
         try:
             result, mask, info = render_engine(image, args.bbox, args.text, engine,
-                                               args.page_text, args.font, args.sigma, args.weight, args.font_id)
+                                               args.page_text, args.font, args.sigma, args.weight, args.font_id, args.pen_x)
         except (ValueError, RuntimeError) as exc:
             print(f"render_candidates: glyph_engine failed: {exc}\n"
                   "  hint: pass --page-text for the original line, or use --legacy for the old inpaint path",

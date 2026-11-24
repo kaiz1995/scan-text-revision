@@ -19,12 +19,17 @@ baseline helpers) is an optional helper used by :func:`render` and the CLI.
 
 Design notes (all numbers validated on the reference photograph):
 
-* **Full ink colour is the 99th percentile of glyph-core pixels**, never the
-  median.  The median is 5-8 levels darker on the reference image and makes a
-  rewritten run visibly lower-contrast.
-* **Borrowed mattes are clipped to their own connected component** dilated by
-  ``CLIP_DILATE`` px.  A rectangular crop drags in the blur tails of the
-  neighbouring glyphs; on the reference image that shows up as a phantom dot.
+* **Ink polarity is measured, not assumed.**  ``measure`` decides whether the
+  glyphs are darker or lighter than the paper and stores ``polarity`` (-1 dark
+  ink, +1 light ink).  All coverage maths uses a signed difference so a normal
+  white-paper scan and its negative take the same code path.
+* **Full ink colour is the extreme luminance decile of glyph-core pixels**,
+  never the median.  The median is 5-8 levels darker on the reference image and
+  makes a rewritten run visibly lower-contrast.
+* **Borrowed mattes keep every component that mostly lies inside the glyph
+  box**, then are dilated by ``CLIP_DILATE`` px.  A rectangular crop drags in
+  the blur tails of the neighbouring glyphs; keeping only one component drops
+  the separated parts of characters such as "三" or "清".
 * **Missing glyphs are synthesised** at 4x supersampling, with the stroke
   weight calibrated against the measured stroke width and the blur matched
   against the source mattes, then peak-normalised.
@@ -101,12 +106,17 @@ _JPEG_PHASE = 8
 DEFAULT_FONT_FILES = (
     "msyh.ttc", "msyhbd.ttc", "msyhl.ttc",
     "simhei.ttf",
+    "simfang.ttf", "simkai.ttf",
+    "STFANGSO.TTF", "STZHONGS.TTF", "STSONG.TTF", "STKAITI.TTF",
+    "Songti.ttc", "Songti SC.ttc", "PingFang.ttc", "Hiragino Sans GB.ttc",
     "NotoSansSC-VF.ttf", "NotoSansCJK-Regular.ttc", "NotoSansCJKsc-Regular.otf",
+    "NotoSerifCJK-Regular.ttc", "NotoSansCJK-Regular.otf",
     "SourceHanSansSC-Regular.otf", "SourceHanSansSC-VF.otf",
     "Deng.ttf", "Dengb.ttf", "Dengl.ttf",
     "msjh.ttc", "msjhl.ttc",
     "simsun.ttc", "simsunb.ttf",
     "NotoSerifSC-VF.ttf",
+    "wqy-zenhei.ttc", "wqy-microhei.ttc", "DroidSansFallback.ttf",
 )
 
 _FONT_CACHE: dict[tuple[str, int], Any] = {}
@@ -395,8 +405,63 @@ def _clip_box(box: Sequence[float], width: int, height: int) -> tuple[int, int, 
 # --------------------------------------------------------------------------
 # measurement
 # --------------------------------------------------------------------------
-def measure(image: np.ndarray, box: tuple[int, int, int, int]) -> dict:
+def _estimate_polarity(
+    lum: np.ndarray, lum_bg: np.ndarray, threshold: float = ROUGH_THRESHOLD
+) -> int:
+    """Decide whether the ink is darker (-1) or lighter (+1) than the paper.
+
+    The background fit is biased by the glyph pixels themselves, so the two
+    tails are compared rather than the distribution mean: the ink side has both
+    more pixels and a larger departure from the background.  Count times median
+    amplitude keeps sparse noise pixels from outvoting a thin stroke.
+    """
+    diff = lum - lum_bg
+    pos = diff > threshold
+    neg = diff < -threshold
+
+    def strength(mask: np.ndarray) -> float:
+        n = int(mask.sum())
+        if n == 0:
+            return 0.0
+        return float(n) * float(np.median(np.abs(diff[mask])))
+
+    return 1 if strength(pos) > strength(neg) else -1
+
+
+def _initial_background(
+    rgb: np.ndarray, x0: int, y0: int, lum: np.ndarray
+) -> np.ndarray:
+    """Background surface fitted on paper pixels only.
+
+    Fitting on every pixel lets dense glyphs pull the surface towards the ink
+    (a 240-level paper measured as 215), which then makes the polarity test and
+    the free-pixel mask both wrong.  The histogram mode is the paper level as
+    long as the box contains more paper than ink; a robust spread around it
+    selects the fit pixels without knowing the ink direction.
+    """
+    hist, edges = np.histogram(lum, bins=64, range=(0.0, 256.0))
+    peak = int(np.argmax(hist))
+    mode = 0.5 * (float(edges[peak]) + float(edges[peak + 1]))
+    mad = 1.4826 * float(np.median(np.abs(lum - mode)))
+    band = min(40.0, max(ROUGH_THRESHOLD, 3.0 * mad))
+    free = np.abs(lum - mode) <= band
+    # keep the antialiased glyph fringe out of the fit
+    free &= _dilate((~free).astype(np.float32), 2, "square") <= 0.5
+    if int(free.sum()) < 40:
+        free = np.ones(lum.shape, bool)
+    return _poly_bg(rgb, x0, y0, free)
+
+
+def measure(
+    image: np.ndarray,
+    box: tuple[int, int, int, int],
+    polarity: int | None = None,
+) -> dict:
     """Measure a text line inside ``box = (x0, y0, x1, y1)``.
+
+    ``polarity`` is -1 for dark ink on light paper, +1 for light ink on a dark
+    background.  ``None`` (default) estimates it from the image; the result is
+    stored as ``metrics["polarity"]`` and all coverage maths follows it.
 
     Returns a dict with the fixed keys
 
@@ -404,7 +469,7 @@ def measure(image: np.ndarray, box: tuple[int, int, int, int]) -> dict:
     ``alpha``         glyph coverage 0..1, ROI shaped, float32 (H,W)
     ``baseline_a``    baseline y at ``baseline_x0``
     ``baseline_b``    baseline slope dy/dx
-    ``ink_rgb``       full ink colour, glyph-core 99th percentile (3,)
+    ``ink_rgb``       full ink colour, glyph-core extreme decile (3,)
     ``sigma``         blur sigma used for rendering (edge PSF until identified)
     ``stroke_px``     median stroke width over glyph components, px
     ``glyphs``        per-component measurements (bbox, ink, stroke, ...)
@@ -420,8 +485,12 @@ def measure(image: np.ndarray, box: tuple[int, int, int, int]) -> dict:
     rgb = rgb_full[y0:y1, x0:x1]
 
     lum = _lum(rgb)
-    bg0 = _poly_bg(rgb, x0, y0, np.ones(lum.shape, bool))
-    rough = (lum - _lum(bg0)) > ROUGH_THRESHOLD
+    bg0 = _initial_background(rgb, x0, y0, lum)
+    if polarity is None:
+        polarity = _estimate_polarity(lum, _lum(bg0))
+    elif polarity not in (-1, 1):
+        raise ValueError("polarity must be -1, +1 or None")
+    rough = (polarity * (lum - _lum(bg0))) > ROUGH_THRESHOLD
     if int(rough.sum()) < 16:
         raise ValueError(
             f"no glyph ink found in box {(x0, y0, x1, y1)}; "
@@ -436,16 +505,24 @@ def measure(image: np.ndarray, box: tuple[int, int, int, int]) -> dict:
 
     bg = _poly_bg(rgb, x0, y0, free)
     lum_bg = _lum(bg)
-    ink_level = float(np.percentile(lum[rough], 96))
     bg_med = float(np.median(lum_bg))
-    alpha = np.clip((lum - lum_bg) / max(ink_level - bg_med, 1e-3), 0.0, 1.0).astype(np.float32)
+    if polarity > 0:
+        ink_level = float(np.percentile(lum[rough], 96))
+        alpha = np.clip(
+            (lum - lum_bg) / max(ink_level - bg_med, 1e-3), 0.0, 1.0
+        ).astype(np.float32)
+    else:
+        ink_level = float(np.percentile(lum[rough], 4))
+        alpha = np.clip(
+            (lum_bg - lum) / max(bg_med - ink_level, 1e-3), 0.0, 1.0
+        ).astype(np.float32)
 
-    glyphs = _measure_components(rgb, alpha, x0, y0)
+    glyphs = _measure_components(rgb, alpha, x0, y0, polarity, bg)
 
     core_all = alpha > 0.85
     if int(core_all.sum()) < 16:
         core_all = alpha > 0.6
-    ink_rgb, ink_lum = _ink_vector(rgb, core_all, lum)
+    ink_rgb, ink_lum = _ink_vector(rgb, core_all, lum, polarity, bg)
     stroke_px = float(np.median([g["stroke_px"] for g in glyphs])) if glyphs else 0.0
 
     baseline_a, baseline_b, baseline_x0, cluster = _fit_baseline(glyphs, x0)
@@ -475,6 +552,7 @@ def measure(image: np.ndarray, box: tuple[int, int, int, int]) -> dict:
         "baseline_b": float(baseline_b),
         "baseline_x0": float(baseline_x0),
         "baseline_cluster": int(cluster),
+        "polarity": int(polarity),
         "ink_rgb": ink_rgb,
         "ink_lum": ink_lum,
         "sigma": float(sigma_psf),
@@ -491,7 +569,11 @@ def measure(image: np.ndarray, box: tuple[int, int, int, int]) -> dict:
 
 
 def _ink_vector(
-    sub_rgb: np.ndarray, core: np.ndarray, lum_arr: np.ndarray
+    sub_rgb: np.ndarray,
+    core: np.ndarray,
+    lum_arr: np.ndarray,
+    polarity: int,
+    bg_rgb: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float]:
     """Full-coverage ink as a colour that actually occurs in the image.
 
@@ -500,11 +582,33 @@ def _ink_vector(
     colour is bluer than anything in the picture (measured +15 on B here) and the
     composite comes out too white. Instead pick one high-luminance quantile and
     take the vector median there, so the level and the hue stay consistent.
+    For dark ink the same logic is mirrored onto the low-luminance decile.
     """
     lv = lum_arr[core]
     if lv.size == 0:
-        return np.array([200.0, 210.0, 225.0], np.float32), 210.0
-    sel = core & (lum_arr >= float(np.percentile(lv, 90)))
+        # no usable core: derive a plausible ink from the local background and
+        # the measured direction instead of a hard-coded pale blue
+        if bg_rgb is None:
+            # light ink sits on a dark ground and vice versa
+            base = np.full(3, 40.0 if polarity > 0 else 240.0, np.float32)
+        else:
+            arr = np.asarray(bg_rgb, np.float32)
+            # callers pass the (H, W, 3) background surface; reduce it to one colour
+            base = arr.reshape(3) if arr.size == 3 else np.median(arr.reshape(-1, 3), axis=0).astype(np.float32)
+        frac = 0.35 if polarity > 0 else 0.40
+        vec = (
+            base + frac * (255.0 - base)
+            if polarity > 0
+            else base * (1.0 - frac)
+        )
+        vec = np.clip(vec, 0.0, 255.0).astype(np.float32)
+        level = float(0.299 * vec[0] + 0.587 * vec[1] + 0.114 * vec[2])
+        return vec, level
+    edge = float(np.percentile(lv, 90 if polarity > 0 else 10))
+    if polarity > 0:
+        sel = core & (lum_arr >= edge)
+    else:
+        sel = core & (lum_arr <= edge)
     if int(sel.sum()) < 4:
         sel = core
     vec = np.array(
@@ -515,7 +619,12 @@ def _ink_vector(
 
 
 def _measure_components(
-    rgb: np.ndarray, alpha: np.ndarray, x0: int, y0: int
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    x0: int,
+    y0: int,
+    polarity: int,
+    bg: np.ndarray | None = None,
 ) -> list[dict]:
     n, labels, stats = _components(alpha > 0.5)
     lum = _lum(rgb)
@@ -535,7 +644,10 @@ def _measure_components(
         if int(core.sum()) < 4:
             core = m
         sub_rgb = rgb[by:by + bh, bx:bx + bw]
-        ink, ink_lum = _ink_vector(sub_rgb, core, lum[by:by + bh, bx:bx + bw])
+        sub_bg = None if bg is None else bg[by:by + bh, bx:bx + bw]
+        ink, ink_lum = _ink_vector(
+            sub_rgb, core, lum[by:by + bh, bx:bx + bw], polarity, sub_bg
+        )
         # perceived tone: median of the core. `ink_lum` is the full-coverage level
         # (top decile) and is driven by JPEG ringing, which a rebuilt glyph does not
         # reproduce -- comparing it would reward over-bright text.
@@ -712,16 +824,24 @@ def build_glyph_library(
     boxes: list[tuple],
     pad: int = PAD,
     clip_dilate: int = CLIP_DILATE,
+    space_after: Sequence[bool] | None = None,
 ) -> dict[str, list[dict]]:
     """Cut glyph mattes out of the measured image.
 
     ``boxes`` is a list of ``(char, x, y, w, h)`` ink boxes (absolute pixels).
     Each matte is normalised by its own full-ink level, clipped to its own
-    connected component dilated by ``clip_dilate`` px, and stored with its
-    absolute origin and measured source advance::
+    connected components dilated by ``clip_dilate`` px, and stored with its
+    absolute origin and measured source advance.  Every component with at
+    least half its area inside the glyph box joins the matte, so a character
+    made of separated parts ("三", "海", "清") is not truncated::
 
         {char: [{'alpha': 2d float32, 'ink': (3,), 'origin': (x, y),
-                 'box': (x, y, w, h), 'advance': float | None}, ...]}
+                 'box': (x, y, w, h), 'advance': float | None,
+                 'space_after': bool}, ...]}
+
+    ``space_after`` (aligned with ``boxes``) marks source glyphs followed by a
+    blank in the page text; their measured advance spans that blank, and
+    ``render`` uses it only where the new text has a blank there too.
     """
     rgb_full = _as_rgb_float(image)
     x0, y0, x1, y1 = metrics["box"]
@@ -730,10 +850,11 @@ def build_glyph_library(
     bg = np.asarray(metrics["bg"], np.float32)
     lum = _lum(rgb)
     lum_bg = _lum(bg)
+    polarity = int(metrics.get("polarity", 1))
     n, labels, stats = _components(alpha > 0.5)
 
     entries: list[dict] = []
-    for item in boxes:
+    for idx, item in enumerate(boxes):
         if len(item) != 5:
             raise ValueError(f"glyph box must be (char, x, y, w, h), got {item!r}")
         ch, bx, by, bw, bh = item
@@ -752,18 +873,22 @@ def build_glyph_library(
         sub_alpha = alpha[sl]
         sub_lb = lum_bg[sl]
 
-        # own connected component: the one under the box centre, else the one
-        # covering most of the box (thin glyphs can have an empty centre)
-        cx = int(round(bx + bw / 2.0 - x0))
-        cy = int(round(by + bh / 2.0 - y0))
-        li = int(labels[cy, cx]) if (0 <= cy < alpha.shape[0] and 0 <= cx < alpha.shape[1]) else 0
-        if li <= 0:
-            box_labels = labels[sl]
-            vals, counts = np.unique(box_labels[box_labels > 0], return_counts=True)
-            if vals.size:
-                li = int(vals[int(np.argmax(counts))])
+        # every component with >= half its area inside the glyph box belongs to
+        # the character; a single centre component drops separated radicals
+        keep_labels: list[int] = []
+        ix0, ix1 = max(0, bx - x0), min(alpha.shape[1], bx + bw - x0)
+        iy0, iy1 = max(0, by - y0), min(alpha.shape[0], by + bh - y0)
+        if ix1 > ix0 and iy1 > iy0:
+            in_box = labels[iy0:iy1, ix0:ix1]
+            vals, counts = np.unique(in_box[in_box > 0], return_counts=True)
+            for val, cnt in zip(vals, counts):
+                if 2 * int(cnt) >= int(stats[int(val)][4]):
+                    keep_labels.append(int(val))
 
-        own = labels[sl] == li if li > 0 else np.zeros(sub_alpha.shape, bool)
+        if keep_labels:
+            own = np.isin(labels[sl], keep_labels)
+        else:
+            own = sub_alpha > 0.5
         core = own & (sub_alpha > 0.85)
         if int(core.sum()) < 6:
             core = own & (sub_alpha > 0.6)
@@ -773,21 +898,36 @@ def build_glyph_library(
             core = sub_alpha > 0.5
         if int(core.sum()) < 4:
             continue
-        ink, ink_lum = _ink_vector(sub, core, lum[sl])
-        den = max(ink_lum - float(np.median(sub_lb)), 1e-3)
-        a = np.clip((lum[sl] - sub_lb) / den, 0.0, 1.0).astype(np.float32)
-        if li > 0:
-            own_d = _dilate(own.astype(np.float32), clip_dilate, "square")
+        ink, ink_lum = _ink_vector(sub, core, lum[sl], polarity, bg[sl])
+        bg_med = float(np.median(sub_lb))
+        if polarity > 0:
+            den = max(ink_lum - bg_med, 1e-3)
+            a = np.clip((lum[sl] - sub_lb) / den, 0.0, 1.0).astype(np.float32)
         else:
-            own_d = _dilate((sub_alpha > 0.5).astype(np.float32), clip_dilate, "square")
+            den = max(bg_med - ink_lum, 1e-3)
+            a = np.clip((sub_lb - lum[sl]) / den, 0.0, 1.0).astype(np.float32)
+        own_d = _dilate(own.astype(np.float32), clip_dilate, "square")
+        if keep_labels:
+            # the dilated clip keeps this glyph's blur tails but also reaches into its
+            # neighbours; their strokes would travel with the matte when it is moved
+            # (a sliver of "2" reappeared in front of a "0" borrowed to the line start)
+            # grow this glyph and its neighbours one px at a time; a pixel goes to whichever
+            # reaches it first (ties to this glyph), so the neighbours' blur tails stay out
+            mine = own.copy()
+            theirs = (labels[sl] > 0) & ~own
+            for _ in range(int(clip_dilate)):
+                grow_mine = (_dilate(mine.astype(np.float32), 1, "square") > 0.5) & ~theirs
+                grow_theirs = (_dilate(theirs.astype(np.float32), 1, "square") > 0.5) & ~mine & ~grow_mine
+                mine |= grow_mine
+                theirs |= grow_theirs
+            own_d = own_d * (~theirs)
         a *= own_d
 
         stroke = 0.0
-        if li > 0:
-            m = own
-            dist = _distance(m.astype(np.uint8))
-            vals_dt = dist[m]
-            stroke = float(np.median(vals_dt) * 2) if vals_dt.size else 0.0
+        m = own
+        dist = _distance(m.astype(np.uint8))
+        vals_dt = dist[m]
+        stroke = float(np.median(vals_dt) * 2) if vals_dt.size else 0.0
 
         entries.append(
             {
@@ -802,6 +942,7 @@ def build_glyph_library(
                 "cx": float(bx + bw / 2.0),
                 "stroke_px": stroke,
                 "advance": None,
+                "space_after": bool(space_after[idx]) if space_after is not None and idx < len(space_after) else False,
             }
         )
 
@@ -813,6 +954,7 @@ def build_glyph_library(
         gap = nxt["ink_left"] - cur["ink_left"]
         if 0 < gap <= max_gap:
             cur["advance"] = float(gap)
+            cur["next_char"] = nxt["char"]
 
     library: dict[str, list[dict]] = {}
     for g in entries:
@@ -838,8 +980,36 @@ def _font_candidates(font_path: str | None = None) -> list[str]:
     if font_path:
         return [str(font_path)]
     windir = os.environ.get("WINDIR", r"C:\Windows")
-    font_dir = Path(windir) / "Fonts"
-    found = [str(font_dir / name) for name in DEFAULT_FONT_FILES if (font_dir / name).is_file()]
+    home = Path.home()
+    dirs = [Path(windir) / "Fonts"]
+    localapp = os.environ.get("LOCALAPPDATA")
+    if localapp:
+        dirs.append(Path(localapp) / "Microsoft" / "Windows" / "Fonts")
+    dirs += [
+        Path("/System/Library/Fonts"),
+        Path("/Library/Fonts"),
+        home / "Library" / "Fonts",
+        Path("/usr/share/fonts"),
+        Path("/usr/local/share/fonts"),
+        home / ".fonts",
+        home / ".local" / "share" / "fonts",
+    ]
+
+    wanted = {name.lower() for name in DEFAULT_FONT_FILES}
+    found: list[str] = []
+    seen: set[str] = set()
+    for font_dir in dirs:
+        if not font_dir.is_dir():
+            continue
+        for root, _subdirs, files in os.walk(font_dir):
+            for name in files:
+                key = name.lower()
+                if key not in wanted or key in seen:
+                    continue
+                path = Path(root) / name
+                if path.is_file():
+                    found.append(str(path))
+                    seen.add(key)
     return found
 
 
@@ -916,6 +1086,34 @@ def _font_score(
     return float(np.mean(scores))
 
 
+_BEARING_CACHE: dict[tuple[str, str], float] = {}
+_BEARING_REF = 100.0
+
+
+def _ink_bearing(font_path: str, size: float, ch: str) -> float:
+    """Distance from the pen origin to the left ink edge of ``ch`` at ``size`` px.
+
+    ``font.getbbox(ch, anchor="ls")[0]`` is not the ink edge: with the raqm
+    layout engine it returns the pen origin (0) for every glyph, while e.g.
+    simsun's "日" starts 9 px right of the pen at 46 px.  Borrowed glyphs are
+    placed by their measured ink-left, so the side bearing has to be the real
+    one.  Measured once per glyph on a supersampled raster at a reference size
+    (0.5 coverage, the same edge ``measure`` uses) and scaled linearly.
+    """
+    key = (str(font_path), ch)
+    frac = _BEARING_CACHE.get(key)
+    if frac is None:
+        px = _BEARING_REF * SUPERSAMPLE
+        w, h = int(px * 3), int(px * 2)
+        ox, oy = w // 3, int(h * 0.75)
+        img = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(img).text((ox, oy), ch, font=_font(font_path, px), fill=255, anchor="ls")
+        cols = np.where((np.asarray(img) >= 128).any(axis=0))[0]
+        frac = float(cols.min() - ox) / px if cols.size else 0.0
+        _BEARING_CACHE[key] = frac
+    return frac * float(size)
+
+
 def _advance_fit(font_path: str, library: dict[str, list[dict]]) -> dict[float, float] | None:
     """RMSE between font-predicted and measured ink-left positions per size."""
     glyphs = sorted(
@@ -923,20 +1121,47 @@ def _advance_fit(font_path: str, library: dict[str, list[dict]]) -> dict[float, 
     )
     if len(glyphs) < 3:
         return None
-    lo, hi = FONT_SIZE_RANGE
+    lo, hi = _size_search_range(None, library)
     out: dict[float, float] = {}
     for s10 in range(int(lo * 10), int(hi * 10) + 1):
         size = s10 / 10.0
         font = _font(font_path, size)
         first = glyphs[0]
-        pen = first["ink_left"] - float(font.getbbox(first["char"], anchor="ls")[0])
+        pen = first["ink_left"] - _ink_bearing(font_path, size, first["char"])
         errs = []
         for g in glyphs:
-            bb = font.getbbox(g["char"], anchor="ls")
-            errs.append(pen + float(bb[0]) - g["ink_left"])
+            errs.append(pen + _ink_bearing(font_path, size, g["char"]) - g["ink_left"])
             pen += float(font.getlength(g["char"]))
+            if g.get("space_after"):
+                pen += float(font.getlength(" "))
         out[size] = float(np.sqrt(np.mean(np.square(errs))))
     return out
+
+
+def _size_search_range(
+    glyphs: Sequence[dict] | None = None,
+    library: dict[str, list[dict]] | None = None,
+) -> tuple[float, float]:
+    """Bracket the font size from the measured glyph heights.
+
+    CJK ink is about 0.94 em tall while digits are about 0.68 em, so a line
+    that mixes both has a bimodal height distribution.  The upper quantile is
+    used as the em estimate; the returned window is deliberately wide because
+    it only has to contain the true size, the template/advance fit picks it.
+    """
+    heights = [
+        float(g["box"][3])
+        for g in glyphs or []
+        if g.get("area", 0) >= 8 and g.get("box", (0, 0, 0, 0))[3] > 0
+    ]
+    for entries in (library or {}).values():
+        heights += [float(g["box"][3]) for g in entries if g["box"][3] > 0]
+    if not heights:
+        return float(FONT_SIZE_RANGE[0]), float(FONT_SIZE_RANGE[1])
+    est = float(np.percentile(heights, 80)) / 0.94
+    lo = max(10.0, 0.7 * est)
+    hi = max(lo + 2.0, 1.4 * est)
+    return lo, hi
 
 
 def _calibrate_weight(
@@ -967,10 +1192,11 @@ def identify_font(
 ) -> str | None:
     """Identify the typeface, size, sigma and stroke weight from the mattes.
 
-    Scans the usual CJK sans fonts under ``%WINDIR%\\Fonts`` (by default),
-    sizes 38..56 px and sigma 0.6..2.2 with NCC template matching, refines the
-    best candidates, then cross-checks the size against the source line's own
-    advances and calibrates the stroke weight.  Writes ``font_path``,
+    Scans the usual CJK fonts in the system/user font directories (by default),
+    a size window bracketed from the measured glyph heights, and sigma
+    0.6..2.2 with NCC template matching, refines the best candidates, then
+    cross-checks the size against the source line's own advances and calibrates
+    the stroke weight.  Writes ``font_path``,
     ``font_size``, ``font_sigma``, ``font_weight_px``, ``font_ncc`` and
     related keys into ``metrics`` and returns the chosen font path.
     """
@@ -979,11 +1205,12 @@ def identify_font(
         raise ValueError("cannot identify a font without labelled source glyphs")
     candidates = _font_candidates(font_path)
     if not candidates:
-        raise ValueError("no CJK font found in the system Fonts directory")
+        raise ValueError("no CJK font found in the system/user font directories")
     metrics["font_candidates"] = [Path(p).name for p in candidates]
 
-    lo, hi = FONT_SIZE_RANGE
-    coarse_sizes = np.arange(lo, hi + 0.01, 2.0)
+    lo, hi = _size_search_range(metrics.get("glyphs"), library)
+    step = max(2.0, (hi - lo) / 10.0)
+    coarse_sizes = np.arange(lo, hi + 1e-6, step)
     coarse_sigmas = (0.6, 1.0, 1.4, 1.8, 2.2)
 
     scored: list[tuple[float, str, float, float]] = []
@@ -1000,10 +1227,12 @@ def identify_font(
     # refine around the best two configurations
     refined: list[tuple[float, str, float, float]] = []
     seen = set()
+    span = max(3, min(6, int(math.ceil(step))))
     for base_score, path, size, sigma in scored[:2]:
-        for ds in range(-3, 4):
+        base = float(round(size))
+        for ds in range(-span, span + 1):
             for dsig in (-0.4, -0.2, 0.0, 0.2, 0.4):
-                s = size + ds
+                s = base + ds
                 g = sigma + dsig
                 if not (lo <= s <= hi) or not (FONT_SIGMA_RANGE[0] <= g <= FONT_SIGMA_RANGE[1]):
                     continue
@@ -1087,13 +1316,11 @@ def _default_pen(text: str, metrics: dict, library: dict[str, list[dict]], font)
     if not text:
         raise ValueError("text must not be empty")
     ch = text[0]
-    glyphs = library.get(ch) or []
-    if glyphs:
-        base = float(glyphs[0]["ink_left"])
-    else:
-        base = float(metrics["baseline_x0"])
+    # the new line starts where the source line's ink starts, whichever glyph comes first
+    lefts = [float(g["ink_left"]) for lst in library.values() for g in lst]
+    base = min(lefts) if lefts else float(metrics["baseline_x0"])
     if font is not None:
-        base -= float(font.getbbox(ch, anchor="ls")[0])
+        base -= _ink_bearing(font.path, font.size, ch)
     return base
 
 
@@ -1175,9 +1402,14 @@ def render(
     missing_advance = advance == "auto" and any(
         ch in library and not any(g.get("advance") for g in library[ch]) for ch in text[:-1]
     )
+    # a borrowed advance that spans a source blank needs the font where the new text has none
+    space_mismatch = advance == "auto" and any(
+        ch in library and any(g.get("space_after") for g in library[ch]) and not text[i + 1].isspace()
+        for i, ch in enumerate(text[:-1])
+    )
     font = None
     path = font_path or metrics.get("font_path")
-    if path is None and (needs_synth or missing_advance):
+    if path is None and (needs_synth or missing_advance or space_mismatch):
         path = _ensure_font(metrics, library, None)
     elif path is not None and (
         metrics.get("font_size") is None or metrics.get("font_path") != path
@@ -1201,11 +1433,17 @@ def render(
     placements: list[tuple[np.ndarray, float, float, str]] = []
     ink_total = np.zeros(3, np.float64)
     ink_weight = 0.0
-    for ch in text:
+    skip_blank = False
+    for i, ch in enumerate(text):
+        if ch.isspace() and skip_blank:
+            # the borrowed glyph before it already advanced over this blank
+            skip_blank = False
+            continue
+        skip_blank = False
         bbox_left = 0.0
         adv_font = None
         if font is not None:
-            bbox_left = float(font.getbbox(ch, anchor="ls")[0])
+            bbox_left = _ink_bearing(font.path, font.size, ch)
             adv_font = float(font.getlength(ch))
         glyphs = library.get(ch) or []
         if glyphs:
@@ -1219,13 +1457,30 @@ def render(
             )
             dx = dst_ink_left - float(src["ink_left"])
             dy = float(metrics["baseline_b"]) * dx
-            placements.append((src["alpha"], src["origin"][0] + dx, src["origin"][1] + dy, "borrow"))
+            # whole-pixel placement: a fractional shift re-interpolates the matte and halves
+            # its full-ink core (a "5" behind a synthetic "8" kept 7 of 15 core px and read
+            # 6 levels lighter); the pen itself keeps sub-pixel precision, so no drift builds up
+            placements.append((src["alpha"], float(round(src["origin"][0] + dx)), float(round(src["origin"][1] + dy)),
+                               "borrow", np.asarray(src["ink"], np.float32)))
             weight_area = float(src["box"][2] * src["box"][3])
             ink_total += weight_area * np.asarray(src["ink"], np.float64)
             ink_weight += weight_area
             step = None if advance == "font" else src.get("advance")
+            blank_next = i + 1 < len(text) and text[i + 1].isspace()
+            had_blank = bool(src.get("space_after"))
+            if step is not None and had_blank != blank_next and adv_font is not None:
+                # the measured advance includes (or lacks) a blank the new text does
+                # not have (or has) here: take the font advance and set blanks by font
+                step = None
+            used_source_advance = step is not None
+            if used_source_advance and font is not None and src.get("next_char"):
+                # the measured advance runs ink-left to ink-left; the pen moves by it plus
+                # this glyph's side bearing minus the source neighbour's, otherwise the
+                # bearing difference is applied twice (a replayed "日" landed 7 px right)
+                step = float(step) + bbox_left - _ink_bearing(font.path, font.size, src["next_char"])
             if step is None:
                 step = adv_font if adv_font is not None else float(src["box"][2] + 2)
+            skip_blank = blank_next and had_blank and used_source_advance
         else:
             a = _render_glyph(ch, path, size, sigma, weight)
             ys, xs = np.where(a > 0.002)
@@ -1239,7 +1494,8 @@ def render(
             c += c % 2
             left = pen - c / 2.0 + tx0
             top = baseline_y(pen, metrics) + v_off - c / 2.0 + ty0
-            placements.append((a, left, top, "synth"))
+            placements.append((a, float(round(left)), float(round(top)), "synth",
+                               np.asarray(metrics["ink_rgb"], np.float32)))
             weight_area = max(1.0, 0.45 * float(size) * float(size))
             ink_total += weight_area * np.asarray(metrics["ink_rgb"], np.float64)
             ink_weight += weight_area
@@ -1248,11 +1504,16 @@ def render(
 
     if not placements:
         raise ValueError("nothing to render")
-    lefts = [p[1] for p in placements]
-    tops = [p[2] for p in placements]
     rights = [p[1] + p[0].shape[1] for p in placements]
     bottoms = [p[2] + p[0].shape[0] for p in placements]
-    if min(lefts) < x0 - 1e-6 or min(tops) < y0 - 1e-6:
+    # a borrowed matte carries PAD px of empty context; only ink may not leave the box
+    ink_lefts, ink_tops = [], []
+    for a, left, top, _kind, _ink in placements:
+        ys, xs = np.where(a > 0.02)
+        if len(xs):
+            ink_lefts.append(left + float(xs.min()))
+            ink_tops.append(top + float(ys.min()))
+    if (ink_lefts and min(ink_lefts) < x0 - 1e-6) or (ink_tops and min(ink_tops) < y0 - 1e-6):
         raise ValueError(
             "rendered text overruns the measured box to the left/top; "
             "expand box and re-measure"
@@ -1260,16 +1521,28 @@ def render(
     frame_x1 = int(min(img_w, max(x1, int(math.ceil(max(rights))))))
     frame_y1 = int(min(img_h, max(y1, int(math.ceil(max(bottoms))))))
     patch = np.zeros((frame_y1 - y0, frame_x1 - x0), np.float32)
-    for a, left, top, _kind in placements:
+    # every glyph keeps its own full ink: a borrowed matte is normalised by its own core
+    # level, so inking it with a line average re-tones it (a replayed "7" came out 6
+    # levels lighter, "日" 6 darker).  ink_num/ink_den blend overlapping glyph edges.
+    ink_num = np.zeros(patch.shape + (3,), np.float32)
+    ink_den = np.zeros(patch.shape, np.float32)
+    for a, left, top, _kind, glyph_ink in placements:
         _add_patch(patch, a, left - x0, top - y0)
+        own = np.zeros_like(patch)
+        _add_patch(own, a, left - x0, top - y0)
+        ink_num += own[:, :, None] * glyph_ink.reshape(1, 1, 3)
+        ink_den += own
     if ink is not None:
         ink_rgb = np.asarray(ink, np.float32).reshape(3)
-    elif ink_weight > 0:
-        # one colour has to serve the whole patch: the area-weighted mean of the
-        # borrowed glyph inks (and the measured ink for synthetic glyphs)
-        ink_rgb = (ink_total / ink_weight).astype(np.float32)
+        metrics.pop("ink_field", None)
     else:
-        ink_rgb = np.asarray(metrics["ink_rgb"], np.float32)
+        # area-weighted mean, reported and used where no glyph covers a pixel
+        ink_rgb = (ink_total / ink_weight).astype(np.float32) if ink_weight > 0 else np.asarray(
+            metrics["ink_rgb"], np.float32)
+        field = np.broadcast_to(ink_rgb.reshape(1, 1, 3), ink_num.shape).copy()
+        covered = ink_den > 1e-4
+        field[covered] = ink_num[covered] / ink_den[covered][:, None]
+        metrics["ink_field"] = field
     return patch, ink_rgb
 
 
@@ -1364,7 +1637,7 @@ def metric_summary(metrics: dict) -> dict:
     """JSON-safe view of a metrics dict (arrays dropped)."""
     keys = [
         "box", "baseline_a", "baseline_b", "baseline_x0", "ink_rgb", "ink_lum",
-        "sigma", "sigma_psf", "sigma_source", "stroke_px", "noise_std",
+        "polarity", "sigma", "sigma_psf", "sigma_source", "stroke_px", "noise_std",
         "glyph_count", "source_text", "font_path", "font_size", "font_sigma",
         "font_weight_px", "font_ncc", "font_size_ncc", "font_advance_rmse",
         "font_id_method",

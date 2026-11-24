@@ -85,6 +85,14 @@ def region_digest(image: Image.Image | None, box):
     return hashlib.sha256(np.asarray(image.crop((x0, y0, x1, y1))).tobytes()).hexdigest()
 
 
+def edit_page(edit):
+    """1-based page of an edit-log entry (default 1), or None when it is not an integer."""
+    value = edit.get("page", 1)
+    if value is None: return 1
+    try: return int(value)
+    except (TypeError, ValueError): return None
+
+
 def mask_bbox(path: Path):
     """Bounding box of the edited region actually touched by the mask."""
     with Image.open(path) as image:
@@ -119,6 +127,7 @@ def save_revised_image(source: Path, revised: Path, out_dir: Path):
     """Write the revised pixels, reusing the source JPEG tables when present."""
     source_meta = image_encoding(source)
     pixels = open_rgb(revised)
+    lossless_options = {"dpi": tuple(source_meta["dpi"])} if source_meta["dpi"] else {}
     if source_meta["qtables"]:
         deliverable = out_dir / "revised-sample.jpg"
         options = {"qtables": source_meta["qtables"],
@@ -129,7 +138,7 @@ def save_revised_image(source: Path, revised: Path, out_dir: Path):
         # Same stem as the JPEG: qa_gate's quantisation check looks for the
         # sibling encoded file of a lossless layer.
         layer = out_dir / "revised-sample.png"
-        pixels.save(layer)
+        pixels.save(layer, **lossless_options)
         output_meta = image_encoding(deliverable)
         match = output_meta["qtables"] == source_meta["qtables"] and output_meta["sampling"] == source_meta["sampling"]
         encoding = {"encoding": "jpeg_source_qtables", "jpeg_qtables_match": match,
@@ -137,7 +146,7 @@ def save_revised_image(source: Path, revised: Path, out_dir: Path):
         return deliverable, layer, encoding
     suffix = source.suffix.lower() if source.suffix.lower() in {".png", ".tif", ".tiff", ".bmp"} else ".png"
     deliverable = out_dir / ("revised-sample" + suffix)
-    pixels.save(deliverable)
+    pixels.save(deliverable, **lossless_options)
     encoding = {"encoding": "lossless_source_format", "jpeg_qtables_match": None, "source_qtables": source_meta}
     return deliverable, deliverable, encoding
 
@@ -263,6 +272,64 @@ def run_gate(source, output, edits):
     return qa_gate.run_gate(str(source), str(output), edits)
 
 
+def _compare_unchanged_page(reference: Image.Image | Path, output: Path) -> dict:
+    """Pixel-wise gate for an untouched page in a multi-page export."""
+    ref_img = reference.convert("RGB") if isinstance(reference, Image.Image) else open_rgb(Path(reference))
+    out_img = open_rgb(Path(output))
+    if ref_img.size != out_img.size:
+        msg = f"unchanged page size {out_img.size} differs from source {ref_img.size}"
+        return {
+            "pass": False,
+            "metrics": {"unchanged_page": True, "outside_max_diff": None, "outside_changed_pixels": None},
+            "checks": [
+                {"name": "unchanged_page", "value": False, "threshold": "== True", "status": "fail", "detail": msg}
+            ],
+            "failures": [msg],
+            "skipped": [],
+            "per_edit": [],
+        }
+    ref_arr = np.asarray(ref_img, dtype=np.int16)
+    out_arr = np.asarray(out_img, dtype=np.int16)
+    diff = np.abs(out_arr - ref_arr).max(axis=2)
+    max_diff = int(diff.max()) if diff.size else 0
+    changed = int((diff > 0).sum())
+    identical = max_diff == 0 and changed == 0
+    failures = [] if identical else [
+        f"unchanged_page: {changed} pixel(s) differ from source (max diff {max_diff})"
+    ]
+    return {
+        "pass": identical,
+        "metrics": {
+            "unchanged_page": True,
+            "outside_max_diff": max_diff,
+            "outside_changed_pixels": changed,
+        },
+        "checks": [
+            {
+                "name": "unchanged_page",
+                "value": identical,
+                "threshold": "== True",
+                "status": "pass" if identical else "fail",
+            },
+            {
+                "name": "outside_max_diff",
+                "value": max_diff,
+                "threshold": "== 0",
+                "status": "pass" if max_diff == 0 else "fail",
+            },
+            {
+                "name": "outside_changed_pixels",
+                "value": changed,
+                "threshold": "== 0",
+                "status": "pass" if changed == 0 else "fail",
+            },
+        ],
+        "failures": failures,
+        "skipped": [],
+        "per_edit": [],
+    }
+
+
 def format_value(value) -> str:
     if value is None: return "—"
     if isinstance(value, bool): return "true" if value else "false"
@@ -361,9 +428,8 @@ def build_review_report(context: dict) -> str:
         lines.append(f"| {region['index']} | {region['page']} | {bbox} | "
                      f"{borrowed} | {synthesized} | `{digest_value}` |")
     lines += ["", "## Manual review", "",
-              "Automatic scores rank candidates; they do not approve an edit. Review the original, "
-              "mask, candidate and zoom comparison before use. Keep the source and treat this file "
-              "as a revision sample, not as evidence.", ""]
+              "Review the original, mask, candidate and zoom comparison before use. Keep the source "
+              "and treat this file as a revision sample, not as evidence.", ""]
     return "\n".join(lines)
 
 
@@ -454,13 +520,23 @@ def main() -> int:
     if args.mask:
         shutil.copy2(args.mask, out / "revision-mask.png")
 
+    # an edit on a page that is not exported would never be checked by the gate
+    if gate_pairs:
+        bad_pages = sorted({str(edit.get("page")) for edit in qa_edits
+                            if not 1 <= (edit_page(edit) or 0) <= len(gate_pairs)})
+        if bad_pages:
+            blocking.append(f"edit-log names page(s) {', '.join(bad_pages)} but the export has "
+                            f"{len(gate_pairs)} page(s); those edits cannot be checked")
+
     # ---- forced QA gate ----
     gate_reports = []
     if not blocking:
         for index, (reference, output) in enumerate(gate_pairs, 1):
-            page_edits = [edit for edit in qa_edits if int(edit.get("page", 1) or 1) == index] or (qa_edits if len(gate_pairs) == 1 else [])
+            page_edits = [edit for edit in qa_edits if edit_page(edit) == index] or (qa_edits if len(gate_pairs) == 1 else [])
             try:
-                if isinstance(reference, Image.Image):
+                if not page_edits:
+                    report = _compare_unchanged_page(reference, output)
+                elif isinstance(reference, Image.Image):
                     with tempfile.TemporaryDirectory() as tmp:
                         reference_path = Path(tmp) / f"reference-{index:03d}.png"
                         reference.save(reference_path)
@@ -509,7 +585,7 @@ def main() -> int:
     for index, edit in enumerate(edits, 1):
         box = edit_bbox(edit)
         region = union_bbox(box, edited_bbox)
-        regions.append({"index": index, "page": int(edit.get("page", 1) or 1), "bbox": list(box) if box else None,
+        regions.append({"index": index, "page": edit.get("page") if edit_page(edit) is None else edit_page(edit), "bbox": list(box) if box else None,
                         "region": [region[0], region[1], region[0] + region[2], region[1] + region[3]] if region else None,
                         "char_sources": char_sources(edit),
                         "hash_algorithm": "sha256/raw-rgb-crop",

@@ -87,14 +87,4 @@ Network errors, non-200 responses, moderation refusals, timeouts (120 s) and emp
 
 ## Roadmap / 未实现
 
-以下能力曾被文档承诺，但当前代码里没有实现；在实现并接入门禁之前，不要当作可用特性引用：
-
-1. **页面分析层 / 版面分析**：文本块、表格线、水印、印章、签名识别，以及区域的 `confidence`、`editable` 属性。`inspect_scan.py` 只输出文件哈希、格式、PDF 元数据/字体/文本层统计、栅格尺寸与 DPI 元数据，不做版面分析。
-2. **多候选与自动评分**：旧文档的「最多生成三个候选」「Automatic scores rank candidates」没有对应代码。`render_candidates.py` 每次调用只产出一个候选，JSON 里只有 `status: candidate`，没有 score 字段；需要多个版本时用不同 `--sigma` / `--weight` / `--font` / `--text` 多次运行并人工比较。
-3. **云端漂移检测与回填**：`cloud_inpaint.py` 不比较未掩膜区域，也没有把云候选贴回页面的代码。唯一的自动像素比对是导出时的 `qa_gate`。
-4. **真实 DPI 推断**：`inspect_scan.py` 固定 `pdftoppm -r 200`；栅格图只读取元数据里的 `dpi` 字段，不做测量，也没有「保留 200+ DPI」的自动逻辑。
-5. **Alpha 软羽化贴回**：旧文档描述的「羽化粘贴」不存在。现在的合成是覆盖率模型 `out = B + A·(I_ink − B)`（`glyph_engine.compose`），软边来自字形自身的 alpha，而不是对矩形补丁做羽化。
-6. **二值扫描件分支**（CCITT G4 / JBIG2）：未覆盖。
-7. **云端适配器的色彩校正、接缝羽化、官方参数枚举对齐**：未实现。
-8. **框选 GUI 的放大镜、多框、并排对比**：`selector.html` 仍是单框（该文件未改动）。
-9. **PSF 的完整 erf 拟合**：当前 `_estimate_sigma` 用 alpha 0.5 交叉处的最大梯度估计 σ（σ = 0.3989 / max|dA/dx|），不是最小二乘曲线拟合。
+尚未实现的能力统一列在 `README.md` 的「Roadmap / 未实现」一节；在实现并接入门禁之前，不要当作可用特性引用。

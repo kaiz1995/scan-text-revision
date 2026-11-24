@@ -39,7 +39,7 @@
    │    或直接给 x,y,w,h + 原行文字（--page-text）
    ▼
 [候选] render_candidates.py  →  glyph_engine.py
-   │  measure              二次曲面背景 B、alpha 覆盖度、基线、满墨色(高光分位的向量中位色)、笔画宽、σ、噪声
+   │  measure              字色方向、二次曲面背景 B、alpha 覆盖度、基线、满墨色(按字色方向取最深/最亮十分位的向量中位色)、笔画宽、σ、噪声
    │  build_glyph_library  --page-text 命中的字 → 连通域裁剪的原始字形遮蔽
    │  render               基线排版；借不到的字用识别字体 4× 超采样合成
    │  compose              out = B + A·(I_ink − B)，仅在掩膜内写回；旧墨由 B+噪声场重建
@@ -241,7 +241,7 @@ python scripts/cloud_inpaint.py crop.png mask.png \
 
 `qa_gate.py` 的 `THRESHOLDS` 就是下面这张表：
 
-字高与基线不是「拿新字底边和邻近某个常数比」：门禁先在被粘连的连通域（如 `3`+`日`）的列投影谷值处切开，再按高度双峰（退化时用宽高比）分成数字与 CJK；数字用源行数字拟合出的基线逐字比较，CJK 只和同形状的源 CJK 比墨顶偏移——数字坐在基线上、CJK 会下沉几像素、整行还有轻微倾斜，这三件事必须分开算。
+字高与基线不是「拿新字底边和邻近某个常数比」：门禁先在被粘连的连通域（如 `3`+`日`）的列投影谷值处切开，先剔除不到最高字一半高的碎块（点、被切开的偏旁），再按高度双峰（退化时用宽高比）分成数字与 CJK；数字用源行数字拟合出的基线逐字比较，CJK 只和同形状的源 CJK 比墨顶偏移——数字坐在基线上、CJK 会下沉几像素、整行还有轻微倾斜，这三件事必须分开算。
 
 | 检查 | 算法 | 阈值 / 状态 |
 | --- | --- | --- |
@@ -249,14 +249,14 @@ python scripts/cloud_inpaint.py crop.png mask.png \
 | `outside_changed_pixels` | 允许区域外发生变化的像素数 | `== 0` |
 | `boundary_step` | 接缝处列/行均值的二阶差分增量 | `< 1.0` |
 | `ink_delta` | 字形核心亮度中位数（感知色调；顶部十分位是 JPEG 振铃，重建字形没有，比它等于奖励"更白"） | `< 3` 级 |
-| `ink_chroma_delta` | 面积加权墨色 RGB 转 CIELAB 后的 ΔE76，与邻近未改动字比较 | `< 3`；色偏的唯一定量防线 |
+| `ink_chroma_delta` | 面积加权墨色 RGB 转 CIELAB 后的 ΔE76；`ink_delta` 和它都与选区内被替换的原字比较（原图对自己比为 0），选区里没有原字时才退回邻近未改动字 | `< 3`；色偏的唯一定量防线 |
 | `stroke_delta` | 距离变换中位数 ×2 的笔画宽 | `< 0.5 px` |
 | `glyph_height_delta` | 数字对源行数字、CJK 对同形状 CJK（bbox 高度差）取最大 | `< 1 px` |
 | `baseline_delta` | 用源行数字拟合 `y = a + b·x`，取每个新数字底边残差的中位数 | `< 1 px`；源数字不足 3 个时 `skipped` |
-| `cjk_baseline_offset` | 新 CJK 与同形状源 CJK 的墨顶，相对同一条拟合基线的偏移 | `< 1 px`；没有同形状 CJK 配对或没有数字基线可依时 `skipped` |
-| `noise_ratio` | 重建区与邻近背景的高频 std 比 | `0.7 ~ 1.4` |
+| `cjk_baseline_offset` | 新 CJK 与同形状源 CJK 的墨顶，相对同一条拟合基线的偏移 | `< 1 px`；基线优先用源行数字拟合，数字不足 3 个时改用至少 3 个未改动源 CJK 字的底边稳健拟合；没有同形状 CJK 配对或两种基线都拟合不出时 `skipped` |
+| `noise_ratio` | 选区内远离新字的全部像素（含旧字原位置）与邻近背景的高频 std 比 | `0.7 ~ 1.4` |
 | `qtables_equal` | 输出 JPEG 量化表 vs 源 | 相等；无损输出且无同级 JPEG 时 `skipped` |
-| `ocr_text` | tesseract 回读 vs `expected_text` | 相等；无 tesseract 时 `skipped` |
+| `ocr_text` | tesseract 回读整个 `region`（新文字比原框长也能读全；只裁 region 本身，四周用它自己的边缘底色补白，不会把相邻的字读进来；按 2×、3×、4× 放大各读一次，多数读对才算对，偶发读错一个对的字不会误判，真错的字每种倍数都会读错）vs `expected_text` | 相等；无 tesseract 时 `skipped`；期望文字含汉字而缺 `chi_sim` 语言包时也是 `skipped`，不会用英文包乱读后判失败 |
 
 三条必须如实转述的语义：
 

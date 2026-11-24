@@ -272,7 +272,9 @@ class PipelineTest(unittest.TestCase):
             five, moon = merged[-2], merged[-1]
             return moon[0] - (five[0] + five[2])
 
-        self.assertGreater(last_gap(info["_cand"]) - last_gap(src), 0.3 * 46)
+        # the blank is set by the font: simsun's is 0.5 em, Noto Serif CJK's 0.26 em
+        blank = glyph_engine._font(FONT, 46.0).getlength(" ")
+        self.assertGreater(last_gap(info["_cand"]) - last_gap(src), 0.7 * blank)
 
     def test_non_integer_page_blocks_export_and_is_recorded(self) -> None:
         src = self.tmp / "badpage.jpg"

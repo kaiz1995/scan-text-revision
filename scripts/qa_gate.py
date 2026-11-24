@@ -330,8 +330,17 @@ def _classify(comps: list[dict]) -> list[dict]:
     gap = 0.0
     cut = 0.0
     if len(hs) > 1:
-        gaps = [(hs[i + 1] - hs[i], i) for i in range(len(hs) - 1)]
-        gap, gi = max(gaps)
+        # two-cluster split minimising within-class variance (Otsu on heights); the
+        # largest single gap can fall inside the digit cluster (a 29 px fragment of a
+        # Noto "发" next to 33-35 px digits turned every digit into "cjk")
+        best = None
+        for i in range(len(hs) - 1):
+            lo, hi = hs[:i + 1], hs[i + 1:]
+            cost = float(np.var(lo)) * len(lo) + float(np.var(hi)) * len(hi)
+            if best is None or cost < best[0]:
+                best = (cost, i)
+        gi = best[1]
+        gap = float(np.median(hs[gi + 1:]) - np.median(hs[:gi + 1]))
         cut = (hs[gi] + hs[gi + 1]) / 2.0
     out = []
     for g in comps:

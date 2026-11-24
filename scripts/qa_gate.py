@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """qa_gate.py — objective acceptance gate for scan text revisions.
 
-Implements the eight metrics from ``IMPLEMENTATION-PLAN.md`` section 2 and
+Implements the twelve checks listed in ``references/quality-checks.md`` and
 answers the only question that matters after an edit: *can you see it?*
 
 ==================  ==================================================  =========
@@ -9,7 +9,8 @@ metric              algorithm                                           threshol
 ==================  ==================================================  =========
 outside region      per-pixel |src-out| outside every declared region    max == 0
 boundary step       second difference of column/row means at the seams     < 1.0
-full-ink colour     glyph-core 99th percentile luminance, vs neighbours    < 3
+full-ink colour     glyph-core median luminance, vs neighbours             < 3
+ink chroma          CIELAB distance of the core ink, vs neighbours         < 3
 stroke width        distance-transform median * 2, vs neighbours          < 0.5 px
 glyph height        bbox height, digits vs digits / CJK vs matched CJK    < 1 px
 baseline            source digit baseline a+b*x, per new digit residual   < 1 px
@@ -276,20 +277,18 @@ def _noise_ratio(
     return round(float(hp_o[rebuilt].std()) / ref_std, 3)
 
 
-def _alpha_and_window(
-    image: np.ndarray, win: tuple[int, int, int, int]
-) -> np.ndarray | None:
+def _measure_window(
+    image: np.ndarray, win: tuple[int, int, int, int], polarity: int | None = None
+) -> dict | None:
+    """``measure`` on a window; pass the source's ``polarity`` when measuring the output."""
     try:
-        return measure(image, win)["alpha"]
+        return measure(image, win, polarity=polarity)
     except ValueError:
         return None
 
 
-def _measure_window(image: np.ndarray, win: tuple[int, int, int, int]) -> dict | None:
-    try:
-        return measure(image, win)
-    except ValueError:
-        return None
+def _polarity(m: dict | None) -> int | None:
+    return int(m["polarity"]) if m and m.get("polarity") in (-1, 1) else None
 
 
 def _centre_inside(g: dict, box: tuple[int, int, int, int]) -> bool:
@@ -594,6 +593,7 @@ def _ocr_read(
         png = Path(tmp) / "crop.png"
         im.save(png)
         langs = ("chi_sim+eng",) if needs_cjk else ("chi_sim+eng", "eng")
+        last_err = ""
         for lang in langs:
             try:
                 res = subprocess.run(
@@ -607,11 +607,29 @@ def _ocr_read(
             except (OSError, subprocess.SubprocessError) as exc:
                 return None, f"tesseract failed: {exc}"
             if res.returncode != 0:
+                last_err = (res.stderr or "").strip()[-300:] or f"exit code {res.returncode}"
                 if needs_cjk:
-                    return None, "未安装 chi_sim 语言包"
+                    if "chi_sim" in last_err or "Failed loading language" in last_err:
+                        return None, "未安装 chi_sim 语言包"
+                    return None, f"tesseract failed: {last_err}"
                 continue
             return res.stdout.strip(), None
-    return None, "tesseract failed for every language pack"
+    return None, f"tesseract failed for every language pack: {last_err}"
+
+
+def _ocr_summary(results: list[dict]) -> tuple[Any, str, str, str | None]:
+    """``(value, threshold, status, detail)`` of ``ocr_text`` over every edit.
+
+    Any failed read fails the check; otherwise any skipped edit makes the whole
+    check ``skipped`` (an unread edit is not a verified one); only all-pass passes.
+    """
+    bad = next((r for r in results if r.get("status") == "fail"), None)
+    if bad is not None:
+        return bad.get("read"), f"== {bad.get('expected')}", "fail", f"tesseract read back {bad.get('read')!r}"
+    skipped = next((r for r in results if r.get("status") == "skipped"), None)
+    if skipped is not None:
+        return None, "== expected_text", "skipped", skipped.get("reason")
+    return "ok", "== expected_text", "pass", None
 
 
 # --------------------------------------------------------------------------
@@ -675,8 +693,10 @@ def run_gate(source_path: str, output_path: str, edits: list[dict]) -> dict:
     seam: list[float] = []
     for e in norm:
         win = _window(e["region"], 4, (h, w))
-        a_s = _alpha_and_window(src, win)
-        a_o = _alpha_and_window(out, win)
+        m_s = _measure_window(src, win)
+        m_o = _measure_window(out, win, _polarity(m_s))
+        a_s = m_s["alpha"] if m_s else None
+        a_o = m_o["alpha"] if m_o else None
         if a_s is None or a_o is None:
             continue
         step = _boundary_step(src, out, e["region"], a_s, a_o, win)
@@ -708,7 +728,7 @@ def run_gate(source_path: str, output_path: str, edits: list[dict]) -> dict:
             min(h, region[3] + 8),
         )
         m_src = _measure_window(src, line_win)
-        m_out = _measure_window(out, line_win)
+        m_out = _measure_window(out, line_win, _polarity(m_src))
         # split glued components (e.g. "3"+"日"), then tag digit / CJK
         src_pool = (
             _classify(_split_wide(src, line_win, m_src, _glyph_pool(m_src))) if m_src else []
@@ -931,17 +951,7 @@ def run_gate(source_path: str, output_path: str, edits: list[dict]) -> dict:
                 "expected": expected,
                 "read": got,
             }
-        results = [e["ocr"] for e in norm]
-        if any(r.get("status") == "fail" for r in results):
-            bad = next(r for r in results if r.get("status") == "fail")
-            add_check(
-                "ocr_text", bad.get("read"), f"== {bad.get('expected')}", "fail",
-                f"tesseract read back {bad.get('read')!r}",
-            )
-        elif all(r.get("status") == "skipped" for r in results):
-            add_check("ocr_text", None, "== expected_text", "skipped", results[0].get("reason"))
-        else:
-            add_check("ocr_text", "ok", "== expected_text", "pass")
+        add_check("ocr_text", *_ocr_summary([e["ocr"] for e in norm]))
 
     if noise_ratios:
         worst_noise = max(noise_ratios, key=lambda v: abs(math.log(max(v, 1e-6))))

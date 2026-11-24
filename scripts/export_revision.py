@@ -85,6 +85,14 @@ def region_digest(image: Image.Image | None, box):
     return hashlib.sha256(np.asarray(image.crop((x0, y0, x1, y1))).tobytes()).hexdigest()
 
 
+def edit_page(edit):
+    """1-based page of an edit-log entry (default 1), or None when it is not an integer."""
+    value = edit.get("page", 1)
+    if value is None: return 1
+    try: return int(value)
+    except (TypeError, ValueError): return None
+
+
 def mask_bbox(path: Path):
     """Bounding box of the edited region actually touched by the mask."""
     with Image.open(path) as image:
@@ -512,11 +520,19 @@ def main() -> int:
     if args.mask:
         shutil.copy2(args.mask, out / "revision-mask.png")
 
+    # an edit on a page that is not exported would never be checked by the gate
+    if gate_pairs:
+        bad_pages = sorted({str(edit.get("page")) for edit in qa_edits
+                            if not 1 <= (edit_page(edit) or 0) <= len(gate_pairs)})
+        if bad_pages:
+            blocking.append(f"edit-log names page(s) {', '.join(bad_pages)} but the export has "
+                            f"{len(gate_pairs)} page(s); those edits cannot be checked")
+
     # ---- forced QA gate ----
     gate_reports = []
     if not blocking:
         for index, (reference, output) in enumerate(gate_pairs, 1):
-            page_edits = [edit for edit in qa_edits if int(edit.get("page", 1) or 1) == index] or (qa_edits if len(gate_pairs) == 1 else [])
+            page_edits = [edit for edit in qa_edits if edit_page(edit) == index] or (qa_edits if len(gate_pairs) == 1 else [])
             try:
                 if not page_edits:
                     report = _compare_unchanged_page(reference, output)

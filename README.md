@@ -39,7 +39,7 @@
    │    或直接给 x,y,w,h + 原行文字（--page-text）
    ▼
 [候选] render_candidates.py  →  glyph_engine.py
-   │  measure              二次曲面背景 B、alpha 覆盖度、基线、满墨色(高光分位的向量中位色)、笔画宽、σ、噪声
+   │  measure              字色方向、二次曲面背景 B、alpha 覆盖度、基线、满墨色(按字色方向取最深/最亮十分位的向量中位色)、笔画宽、σ、噪声
    │  build_glyph_library  --page-text 命中的字 → 连通域裁剪的原始字形遮蔽
    │  render               基线排版；借不到的字用识别字体 4× 超采样合成
    │  compose              out = B + A·(I_ink − B)，仅在掩膜内写回；旧墨由 B+噪声场重建

@@ -589,8 +589,12 @@ def _ink_vector(
         # no usable core: derive a plausible ink from the local background and
         # the measured direction instead of a hard-coded pale blue
         if bg_rgb is None:
-            bg_rgb = np.full(3, 240.0 if polarity > 0 else 40.0, np.float32)
-        base = np.asarray(bg_rgb, np.float32).reshape(3)
+            # light ink sits on a dark ground and vice versa
+            base = np.full(3, 40.0 if polarity > 0 else 240.0, np.float32)
+        else:
+            arr = np.asarray(bg_rgb, np.float32)
+            # callers pass the (H, W, 3) background surface; reduce it to one colour
+            base = arr.reshape(3) if arr.size == 3 else np.median(arr.reshape(-1, 3), axis=0).astype(np.float32)
         frac = 0.35 if polarity > 0 else 0.40
         vec = (
             base + frac * (255.0 - base)
@@ -820,6 +824,7 @@ def build_glyph_library(
     boxes: list[tuple],
     pad: int = PAD,
     clip_dilate: int = CLIP_DILATE,
+    space_after: Sequence[bool] | None = None,
 ) -> dict[str, list[dict]]:
     """Cut glyph mattes out of the measured image.
 
@@ -831,7 +836,12 @@ def build_glyph_library(
     made of separated parts ("三", "海", "清") is not truncated::
 
         {char: [{'alpha': 2d float32, 'ink': (3,), 'origin': (x, y),
-                 'box': (x, y, w, h), 'advance': float | None}, ...]}
+                 'box': (x, y, w, h), 'advance': float | None,
+                 'space_after': bool}, ...]}
+
+    ``space_after`` (aligned with ``boxes``) marks source glyphs followed by a
+    blank in the page text; their measured advance spans that blank, and
+    ``render`` uses it only where the new text has a blank there too.
     """
     rgb_full = _as_rgb_float(image)
     x0, y0, x1, y1 = metrics["box"]
@@ -844,7 +854,7 @@ def build_glyph_library(
     n, labels, stats = _components(alpha > 0.5)
 
     entries: list[dict] = []
-    for item in boxes:
+    for idx, item in enumerate(boxes):
         if len(item) != 5:
             raise ValueError(f"glyph box must be (char, x, y, w, h), got {item!r}")
         ch, bx, by, bw, bh = item
@@ -918,6 +928,7 @@ def build_glyph_library(
                 "cx": float(bx + bw / 2.0),
                 "stroke_px": stroke,
                 "advance": None,
+                "space_after": bool(space_after[idx]) if space_after is not None and idx < len(space_after) else False,
             }
         )
 
@@ -1288,11 +1299,9 @@ def _default_pen(text: str, metrics: dict, library: dict[str, list[dict]], font)
     if not text:
         raise ValueError("text must not be empty")
     ch = text[0]
-    glyphs = library.get(ch) or []
-    if glyphs:
-        base = float(glyphs[0]["ink_left"])
-    else:
-        base = float(metrics["baseline_x0"])
+    # the new line starts where the source line's ink starts, whichever glyph comes first
+    lefts = [float(g["ink_left"]) for lst in library.values() for g in lst]
+    base = min(lefts) if lefts else float(metrics["baseline_x0"])
     if font is not None:
         base -= _ink_bearing(font.path, font.size, ch)
     return base
@@ -1376,9 +1385,14 @@ def render(
     missing_advance = advance == "auto" and any(
         ch in library and not any(g.get("advance") for g in library[ch]) for ch in text[:-1]
     )
+    # a borrowed advance that spans a source blank needs the font where the new text has none
+    space_mismatch = advance == "auto" and any(
+        ch in library and any(g.get("space_after") for g in library[ch]) and not text[i + 1].isspace()
+        for i, ch in enumerate(text[:-1])
+    )
     font = None
     path = font_path or metrics.get("font_path")
-    if path is None and (needs_synth or missing_advance):
+    if path is None and (needs_synth or missing_advance or space_mismatch):
         path = _ensure_font(metrics, library, None)
     elif path is not None and (
         metrics.get("font_size") is None or metrics.get("font_path") != path
@@ -1402,7 +1416,13 @@ def render(
     placements: list[tuple[np.ndarray, float, float, str]] = []
     ink_total = np.zeros(3, np.float64)
     ink_weight = 0.0
-    for ch in text:
+    skip_blank = False
+    for i, ch in enumerate(text):
+        if ch.isspace() and skip_blank:
+            # the borrowed glyph before it already advanced over this blank
+            skip_blank = False
+            continue
+        skip_blank = False
         bbox_left = 0.0
         adv_font = None
         if font is not None:
@@ -1425,8 +1445,16 @@ def render(
             ink_total += weight_area * np.asarray(src["ink"], np.float64)
             ink_weight += weight_area
             step = None if advance == "font" else src.get("advance")
+            blank_next = i + 1 < len(text) and text[i + 1].isspace()
+            had_blank = bool(src.get("space_after"))
+            if step is not None and had_blank != blank_next and adv_font is not None:
+                # the measured advance includes (or lacks) a blank the new text does
+                # not have (or has) here: take the font advance and set blanks by font
+                step = None
+            used_source_advance = step is not None
             if step is None:
                 step = adv_font if adv_font is not None else float(src["box"][2] + 2)
+            skip_blank = blank_next and had_blank and used_source_advance
         else:
             a = _render_glyph(ch, path, size, sigma, weight)
             ys, xs = np.where(a > 0.002)

@@ -26,28 +26,13 @@ sys.path.insert(0, str(SCRIPTS))
 
 import glyph_engine  # noqa: E402
 
-FONT_NAMES = ("simsun.ttc", "NotoSerifCJK-Regular.ttc", "NotoSerifCJKsc-Regular.otf", "Songti.ttc")
-FONT_DIRS = [
-    Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts",
-    Path("/usr/share/fonts"),
-    Path("/usr/local/share/fonts"),
-    Path("/System/Library/Fonts"),
-    Path("/Library/Fonts"),
-]
+FONT_NAMES = ("simsun.ttc", "NotoSerifCJK-Regular.ttc", "Songti.ttc")
 
 
 def find_font() -> str | None:
-    for name in FONT_NAMES:
-        for root in FONT_DIRS:
-            if not root.is_dir():
-                continue
-            direct = root / name
-            if direct.is_file():
-                return str(direct)
-            hits = list(root.rglob(name))
-            if hits:
-                return str(hits[0])
-    return None
+    """A serif CJK font from the same system and user font folders the engine searches."""
+    found = {Path(p).name.lower(): p for p in glyph_engine._font_candidates()}
+    return next((found[n.lower()] for n in FONT_NAMES if n.lower() in found), None)
 
 
 FONT = find_font()
@@ -127,10 +112,10 @@ class PipelineTest(unittest.TestCase):
         info["_cand"], info["_mask"] = cand, mask
         return info
 
-    def _export(self, src: Path, info: dict, bbox, page_text: str, text: str) -> dict:
+    def _export(self, src: Path, info: dict, bbox, page_text: str, text: str, page: int = 1) -> dict:
         log = self.tmp / "edit-log.json"
         log.write_text(json.dumps({"edits": [{
-            "page": 1, "bbox": list(bbox), "original_text": page_text, "replacement_text": text,
+            "page": page, "bbox": list(bbox), "original_text": page_text, "replacement_text": text,
             "approved": True, "candidate": {k: v for k, v in info.items() if not k.startswith("_")},
         }]}, ensure_ascii=False), encoding="utf-8")
         out = self.tmp / "out"
@@ -190,6 +175,86 @@ class PipelineTest(unittest.TestCase):
         names = {c["name"]: c["status"] for c in qa.get("checks", [])}
         self.assertNotEqual(names.get("ink_delta"), "skipped")
         self.assertEqual(qa["_rc"], 0, f"{qa.get('failures')}\n{qa['_stderr']}")
+
+    def test_line_starting_with_a_later_glyph_stays_at_line_start(self) -> None:
+        # "07月30日" borrows its "0" from the middle of "2025年..."; the line must still start at
+        # the original left ink edge, not where that "0" sat in the source line
+        src = self.tmp / "later.jpg"
+        x, y, w, h = make_scan(src, 46)
+        info = self._render(src, (x, y, w, h), DATE, "07月30日")
+        self.assertIn("0", info["glyphs_borrowed"])
+
+        def first_ink(path) -> int:
+            g = np.asarray(Image.open(path).convert("L"), np.float64)[y:y + h, x:x + w]
+            return int(np.where((g < 140).any(axis=0))[0].min())
+
+        self.assertLessEqual(abs(first_ink(info["_cand"]) - first_ink(src)), 2)
+
+    def test_light_text_on_a_dark_band_keeps_its_polarity(self) -> None:
+        # a dark band on white paper: the re-measure margin reaches the white paper and must not
+        # flip the polarity measured on the selected line
+        band = self.tmp / "band_src.jpg"
+        x, y, w, h = make_scan(band, 46, invert=True)
+        dark = np.asarray(Image.open(band).convert("RGB"))
+        page = np.full((dark.shape[0] + 80, dark.shape[1], 3), 245, np.uint8)
+        top, bottom = y - 6, y + h + 6
+        page[40 + top:40 + bottom] = dark[top:bottom]
+        src = self.tmp / "band.png"
+        Image.fromarray(page).save(src)
+        info = self._render(src, (x, y + 40, w, h), DATE, NEW_DATE)
+        self.assertEqual((info.get("measurement") or {}).get("polarity"), 1)
+
+    def test_space_after_a_glyph_that_had_none_is_kept(self) -> None:
+        # "5" occurs twice in the source, once before a blank and once glued to "月"; a blank typed
+        # after the second one is not inside its advance and must be rendered
+        src = self.tmp / "space.jpg"
+        line = "2025 年 5月"
+        x, y, w, h = make_scan(src, 46, text=PREFIX + line)
+        info = self._render(src, (x, y, w, h), line, "2025 年 5 月")
+        self.assertEqual(info.get("segmentation"), "components")
+
+        def last_gap(path) -> int:
+            m = glyph_engine.measure(np.asarray(Image.open(path).convert("RGB")), (x, y, x + w + 60, y + h))
+            merged: list[list[int]] = []
+            for b in sorted((list(g["box"]) for g in m["glyphs"] if g["area"] >= 12), key=lambda b: b[0]):
+                if merged and b[0] <= merged[-1][0] + merged[-1][2]:
+                    merged[-1][2] = max(merged[-1][0] + merged[-1][2], b[0] + b[2]) - merged[-1][0]
+                else:
+                    merged.append(b)
+            five, moon = merged[-2], merged[-1]
+            return moon[0] - (five[0] + five[2])
+
+        self.assertGreater(last_gap(info["_cand"]) - last_gap(src), 0.3 * 46)
+
+    def test_edit_on_a_missing_page_blocks_export(self) -> None:
+        src = self.tmp / "page.jpg"
+        bbox = make_scan(src, 46)
+        info = self._render(src, bbox, DATE, NEW_DATE)
+        qa = self._export(src, info, bbox, DATE, NEW_DATE, page=3)
+        self.assertNotEqual(qa["_rc"], 0, "an edit logged on a page that does not exist must not pass")
+
+    def test_ink_fallback_accepts_a_background_surface(self) -> None:
+        # no usable glyph core: the ink is derived from the (H, W, 3) background surface and lies
+        # between the paper and the extreme on the measured side
+        core = np.zeros((6, 8), bool)
+        light = np.full((6, 8, 3), 236.0, np.float32)
+        _, level = glyph_engine._ink_vector(light, core, light[..., 0], -1, light.copy())
+        self.assertLess(level, 236.0)
+        dark = np.full((6, 8, 3), 30.0, np.float32)
+        _, level = glyph_engine._ink_vector(dark, core, dark[..., 0], 1, dark.copy())
+        self.assertGreater(level, 30.0)
+        _, level = glyph_engine._ink_vector(light, core, light[..., 0], 1, None)
+        self.assertLess(level, 200.0)
+        _, level = glyph_engine._ink_vector(light, core, light[..., 0], -1, None)
+        self.assertGreater(level, 100.0)
+
+    def test_ocr_summary_never_reports_skipped_as_pass(self) -> None:
+        import qa_gate
+        skipped = {"status": "skipped", "reason": "未安装 chi_sim 语言包"}
+        self.assertEqual(qa_gate._ocr_summary([{"status": "pass"}, skipped])[2], "skipped")
+        failed = {"status": "fail", "read": "x", "expected": "y"}
+        self.assertEqual(qa_gate._ocr_summary([skipped, failed])[2], "fail")
+        self.assertEqual(qa_gate._ocr_summary([{"status": "pass"}])[2], "pass")
 
     def test_default_font_is_found(self) -> None:
         # the synthesis / --legacy fallback font comes from the engine's cross-platform font folders

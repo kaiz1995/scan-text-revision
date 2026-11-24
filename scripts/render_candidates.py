@@ -255,22 +255,6 @@ def borrow_boxes(metrics, page_text, engine=None):
         note = "borrowed from width-proportional estimates (connected components did not match --page-text)"
     return [(char, x, y, w, h) for char, (x, y, w, h) in zip(chars, boxes)], note, mode
 
-def engine_text(text, library, spaced_in_source):
-    """Text handed to the engine: blanks that the borrowed advance already covers are dropped.
-
-    A borrowed glyph advances by its measured ink-left to ink-left distance, which
-    already contains the blank that followed it in the source line, so rendering
-    that blank again would double the gap.  Blanks after synthesized glyphs are
-    kept (font advance); leading/trailing blanks are removed.
-    """
-    out = []
-    for i, ch in enumerate(text):
-        if ch.isspace():
-            prev = next((c for c in reversed(text[:i]) if not c.isspace()), None)
-            if prev is None or (library.get(prev) and prev in spaced_in_source): continue
-        out.append(ch)
-    return "".join(out).strip()
-
 def line_left_pen(engine, tight, metrics, first_char, font_path):
     """Pen x that puts a synthesized first glyph at the original line's left ink edge."""
     lefts = [int(g["box"][0]) for g in tight.get("glyphs") or [] if g.get("box") and g.get("area", 8) >= 8]
@@ -356,6 +340,30 @@ def preset_font(metrics, height_source, box, font_path):
 # --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
+def remeasure_with_margin(engine, image, tight, edition, margin):
+    """Measure the selected box plus ``margin`` px, or None when that window is unusable.
+
+    The selected line's polarity is kept.  The window is rejected when the margin
+    reaches paper of another tone (light text on a dark band): the background fitted
+    inside the box then drifts, or a border row/column is almost all "ink", which no
+    neighbouring text produces but a strip of differently toned paper does.
+    """
+    x0, y0, x1, y1 = edition
+    box = (max(0, x0 - margin), max(0, y0 - margin), min(image.width, x1 + margin), min(image.height, y1 + margin))
+    if box == edition: return None
+    try: wide = engine.measure(image, box, polarity=tight["polarity"])
+    except ValueError: return None
+    bx, by = x0 - int(wide["box"][0]), y0 - int(wide["box"][1])
+    inner = np.asarray(wide["lum_bg"])[by:by + y1 - y0, bx:bx + x1 - x0]
+    if abs(float(np.median(inner)) - float(np.median(tight["lum_bg"]))) > float(getattr(engine, "ROUGH_THRESHOLD", 10.0)):
+        return None
+    ink = np.asarray(wide["alpha"]) > 0.5
+    ring_rows = [r for r in range(ink.shape[0]) if r < by or r >= by + y1 - y0]
+    ring_cols = [c for c in range(ink.shape[1]) if c < bx or c >= bx + x1 - x0]
+    if any(ink[r].mean() > 0.8 for r in ring_rows) or any(ink[:, c].mean() > 0.8 for c in ring_cols):
+        return None
+    return wide
+
 def render_engine(image, box, text, engine, page_text, font_path, sigma, weight, want_font_id, pen_x=None):
     image = image.convert("RGB")
     x, y, width, height = box
@@ -369,10 +377,12 @@ def render_engine(image, box, text, engine, page_text, font_path, sigma, weight,
     #    PAD pixels of context) inside the measured box, and the first glyph can
     #    sit a few px left of its ink origin.  The margin gives that slack; the
     #    background is still erased only inside the selected box below.
-    margin = 24
-    expanded = (max(0, edition[0] - margin), max(0, edition[1] - margin),
-                min(image.width, edition[2] + margin), min(image.height, edition[3] + margin))
-    metrics = engine.measure(image, expanded) if expanded != edition else tight
+    metrics, expanded = tight, edition
+    for margin in (24, 12, 6, 3):
+        wide = remeasure_with_margin(engine, image, tight, edition, margin)
+        if wide is not None:
+            metrics, expanded = wide, tuple(int(v) for v in wide["box"])
+            break
     if digit_baseline:
         # digits anchor the baseline; CJK bottoms overshoot it
         metrics["baseline_a"], metrics["baseline_b"], metrics["baseline_x0"] = digit_baseline
@@ -382,11 +392,13 @@ def render_engine(image, box, text, engine, page_text, font_path, sigma, weight,
         for key in ("baseline_a", "baseline_b", "baseline_x0"):
             if tight.get(key) is not None: metrics[key] = tight[key]
     x0, y0, x1, y1 = (int(v) for v in metrics["box"])
-    library = engine.build_glyph_library(image, metrics, boxes) if boxes else {}
+    # which source glyphs had a blank after them: the engine decides per placed instance
+    # whether its measured advance already covers a blank of the new text
+    space_after = [i + 1 < len(page_text) and page_text[i + 1].isspace()
+                   for i, ch in enumerate(page_text or "") if not ch.isspace()]
+    library = engine.build_glyph_library(image, metrics, boxes, space_after=space_after) if boxes else {}
     if not isinstance(library, dict): library = dict(library)
-    spaced = {page_text[i] for i in range(len(page_text) - 1)
-              if page_text[i + 1].isspace() and not page_text[i].isspace()} if page_text else set()
-    render_text = engine_text(text, library, spaced)
+    render_text = text.strip()
     if not render_text: raise ValueError("text must not be empty")
     borrowed = [char for char in dict.fromkeys(text) if library.get(char)]
     synthesized = [char for char in dict.fromkeys(text) if not char.isspace() and not library.get(char)]
@@ -468,6 +480,7 @@ def render_engine(image, box, text, engine, page_text, font_path, sigma, weight,
         "page_text": page_text,
         "measurement": {
             "glyph_components": len(metrics.get("glyphs") or []),
+            "polarity": metrics.get("polarity"),
             "noise_std": [round(float(v), 3) for v in np.asarray(metrics.get("noise_std", [0, 0, 0])).ravel()[:3]],
             "font_size": metrics.get("font_size"),
             "font_weight_px": metrics.get("font_weight_px"),

@@ -14,7 +14,7 @@ Each edit is `{"bbox": [x, y, w, h], "expected_text": "...", "region": [x0, y0, 
 Digits sit on the baseline; CJK glyphs overshoot it by a few px; a slightly tilted line lifts the baseline several px across an edit. Comparing a glyph bottom with "the neighbour baseline at one point" mixes those three effects, so the gate:
 
 - splits components that glued two glyphs together (e.g. `3` + `日`) at the valley of the column-density profile;
-- classifies glyphs as `digit` or `cjk` by the height bimodality (falling back to the width/height ratio);
+- drops fragments lower than half the tallest glyph (dots, radicals cut off a CJK glyph), then classifies glyphs as `digit` or `cjk` by the height bimodality (falling back to the width/height ratio);
 - fits `y = a + b·x` through the **source digits** and compares **each new digit's** bottom with that line at its own x — tilt aware;
 - compares CJK glyphs only with **shape-matched** source CJK glyphs, via their ink-top offset from the same fitted baseline.
 
@@ -27,15 +27,15 @@ Thresholds come from `qa_gate.THRESHOLDS`.
 | `outside_max_diff` | per-pixel max channel difference outside every declared region | `== 0` |
 | `outside_changed_pixels` | count of changed pixels outside the regions | `== 0` |
 | `boundary_step` | max second-difference excess of column/row means at the four region seams | `< 1.0`; `skipped` when no glyph-free seam rows/columns exist |
-| `ink_delta` | median luminance of the glyph core — perceived tone; the top decile is JPEG ringing, which a rebuilt glyph does not carry, so comparing it rewards over-bright text — vs intact neighbouring glyphs | `< 3` levels; needs at least 1 new glyph and 2 intact reference glyphs, otherwise `skipped` |
-| `ink_chroma_delta` | area-weighted ink RGB converted to CIELAB, ΔE76 vs intact neighbouring glyphs | `< 3`; the only check that sees a per-channel colour cast |
+| `ink_delta` | median luminance of the glyph core — perceived tone; the top decile is JPEG ringing, which a rebuilt glyph does not carry, so comparing it rewards over-bright text — vs the source glyphs inside the region that are being replaced (so an untouched source scores 0), or vs intact neighbouring glyphs when the region held none | `< 3` levels; needs at least 1 new glyph and either 1 replaced glyph or 2 intact neighbours, otherwise `skipped` |
+| `ink_chroma_delta` | area-weighted ink RGB converted to CIELAB, ΔE76 against the same reference as `ink_delta` | `< 3`; the only check that sees a per-channel colour cast |
 | `stroke_delta` | stroke width (distance-transform median × 2) vs neighbours | `< 0.5 px`; same skip rule |
 | `glyph_height_delta` | max of digit height (new digits vs source digits) and CJK height (shape-matched pairs, bbox height difference) | `< 1 px` |
 | `baseline_delta` | source-digit baseline `a + b·x`, median residual of every new digit's bottom | `< 1 px`; `skipped` without ≥3 source digits and new digits |
 | `cjk_baseline_offset` | new CJK ink-top minus shape-matched source CJK ink-top, both measured from the fitted baseline | `< 1 px`; the baseline is the source-digit fit, or — on a line with fewer than 3 digits — a robust fit through the bottoms of at least 3 unmodified source CJK glyphs; `skipped` without a shape-matched CJK pair or either baseline (never failed for lack of a reference) |
 | `noise_ratio` | high-pass std of every region pixel away from the new ink (old-ink positions included) over the neighbouring grain | `0.7 – 1.4` |
 | `qtables_equal` | output JPEG quantisation tables vs the source's | equal; `skipped` when the source has none, or the output is lossless without a sibling JPEG |
-| `ocr_text` | tesseract read-back of the whole `region` (so a replacement longer than the box is read in full; only the region itself is cropped and padded with its own border colour, so neighbouring glyphs are not read) vs `expected_text` (spaces stripped) | equal; `skipped` when tesseract is missing or the call fails (`chi_sim+eng`, `--psm 7`; the `eng` fallback is used only when `expected_text` has no CJK, so a missing `chi_sim` pack gives `skipped`, not a garbled `fail`); an empty read against a non-empty expectation is a `fail` |
+| `ocr_text` | tesseract read-back of the whole `region` (so a replacement longer than the box is read in full; only the region itself is cropped and padded with its own border colour, so neighbouring glyphs are not read), read at 2×, 3× and 4× upscale with a majority vote (a correct glyph misread at one scale does not fail; a wrong glyph is misread at every scale), vs `expected_text` (spaces stripped) | equal; `skipped` when tesseract is missing or the call fails (`chi_sim+eng`, `--psm 7`; the `eng` fallback is used only when `expected_text` has no CJK, so a missing `chi_sim` pack gives `skipped`, not a garbled `fail`); an empty read against a non-empty expectation is a `fail` |
 
 ## How to read the result
 

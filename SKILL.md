@@ -66,7 +66,7 @@ Source page previews come from `inspect_scan.py --render-dir` (`page-*.png`), no
 - Font identification searches sizes from 0.7× to 1.4× of the em estimated from the measured glyph heights (80th percentile ÷ 0.94, at least 10 px; `FONT_SIZE_RANGE` 38–56 px is used only when no glyph could be measured) and σ 0.6–2.2 (`FONT_SIGMA_RANGE`), among a fixed list of CJK font filenames (`DEFAULT_FONT_FILES`) found in the system and user font folders on Windows, macOS and Linux. A line set in a font that is not on that list needs an explicit `--font`; `--sigma` / `--weight` override the fitted values.
 - The background model is a per-channel quadratic surface fitted on ink-free pixels. Strongly structured substrate (guilloche, dense rules, photos) is not modelled; use `--legacy` or a cloud candidate and review by eye.
 - Ink polarity is detected per box (`polarity` -1 = dark ink on light paper, +1 = light ink on dark ground); a box that mixes both is not supported.
-- All glyphs in one patch share a single full-ink colour (area-weighted mean of the borrowed cores). A line with mixed ink colours will not match everywhere.
+- Each borrowed glyph is inked with its own measured full-ink colour and synthesized glyphs with the line's measured ink, so a synthesized glyph next to an unusually dark or light original may still differ slightly.
 - The erase domain is the selected box, replaced by fitted background plus borrowed residual noise. Keep the box tight.
 - Binarised scans (CCITT G4 / JBIG2) are not covered.
 - `render_candidates.py` asserts that `compose()` changed no pixel outside its mask; that is an internal invariant, not proof of invisibility. Only the gate quantifies the result.

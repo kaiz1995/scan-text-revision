@@ -103,10 +103,10 @@ class PipelineTest(unittest.TestCase):
         self.assertGreater(float(np.mean(m["ink_rgb"])), 180.0)
 
     # -- render + gate + export -------------------------------------------
-    def _render(self, src: Path, bbox, page_text: str, text: str, name: str = "cand") -> dict:
+    def _render(self, src: Path, bbox, page_text: str, text: str, *extra: str, name: str = "cand") -> dict:
         cand, mask = self.tmp / f"{name}.png", self.tmp / f"{name}_mask.png"
         r = run(str(SCRIPTS / "render_candidates.py"), str(src), "--bbox", ",".join(map(str, bbox)),
-                "--page-text", page_text, "--text", text, "--output", str(cand), "--mask", str(mask))
+                "--page-text", page_text, "--text", text, "--output", str(cand), "--mask", str(mask), *extra)
         self.assertEqual(r.returncode, 0, r.stderr)
         info = json.loads(r.stdout)
         info["_cand"], info["_mask"] = cand, mask
@@ -190,19 +190,67 @@ class PipelineTest(unittest.TestCase):
 
         self.assertLessEqual(abs(first_ink(info["_cand"]) - first_ink(src)), 2)
 
-    def test_light_text_on_a_dark_band_keeps_its_polarity(self) -> None:
-        # a dark band on white paper: the re-measure margin reaches the white paper and must not
-        # flip the polarity measured on the selected line
+    def _band(self, extra: int) -> tuple[Path, tuple[int, int, int, int]]:
+        """Light text on a dark band that reaches ``extra`` px past the box, on white paper."""
         band = self.tmp / "band_src.jpg"
         x, y, w, h = make_scan(band, 46, invert=True)
         dark = np.asarray(Image.open(band).convert("RGB"))
         page = np.full((dark.shape[0] + 80, dark.shape[1], 3), 245, np.uint8)
-        top, bottom = y - 6, y + h + 6
+        top, bottom = y - extra, y + h + extra
         page[40 + top:40 + bottom] = dark[top:bottom]
-        src = self.tmp / "band.png"
+        src = self.tmp / f"band{extra}.png"
         Image.fromarray(page).save(src)
-        info = self._render(src, (x, y + 40, w, h), DATE, NEW_DATE)
+        return src, (x, y + 40, w, h)
+
+    def test_light_text_on_a_dark_band_keeps_its_polarity(self) -> None:
+        # the re-measure margin reaches the white paper and must not flip the polarity
+        src, box = self._band(6)
+        info = self._render(src, box, DATE, NEW_DATE)
         self.assertEqual((info.get("measurement") or {}).get("polarity"), 1)
+
+    def test_tight_band_moves_a_later_glyph_to_line_start(self) -> None:
+        # with almost no margin the borrowed "0" moves to the line start; only its empty
+        # matte padding leaves the box, which must not count as an overrun
+        src, box = self._band(2)
+        self._render(src, box, DATE, "07月30日")
+
+    def test_replay_with_font_keeps_source_spacing(self) -> None:
+        # with a font loaded the borrowed advance must not add the side-bearing difference again
+        src = self.tmp / "replay.jpg"
+        x, y, w, h = make_scan(src, 46)
+        info = self._render(src, (x, y, w, h), DATE, DATE, "--font", FONT)
+
+        def last_ink(path) -> int:
+            g = np.asarray(Image.open(path).convert("L"), np.float64)[y:y + h, x:x + w + 40]
+            return int(np.where((g < 140).any(axis=0))[0].max())
+
+        self.assertLessEqual(abs(last_ink(info["_cand"]) - last_ink(src)), 1)
+
+    def test_given_font_is_used_and_reported(self) -> None:
+        others = [p for p in glyph_engine._font_candidates() if Path(p).name.lower() != Path(FONT).name.lower()]
+        if not others:
+            self.skipTest("only one CJK font installed")
+        src = self.tmp / "given.jpg"
+        line = "2025 年 07 月"
+        bbox = make_scan(src, 46, text=PREFIX + line)
+        # dropping the blanks needs the font even though every glyph is borrowed
+        info = self._render(src, bbox, line, "2025年07月", "--font", others[0])
+        self.assertEqual(Path(info["font"]).name.lower(), Path(others[0]).name.lower())
+
+    def test_advance_fit_counts_source_blanks(self) -> None:
+        import render_candidates
+        src = self.tmp / "fit.jpg"
+        line = "2025 年 07 月"
+        x, y, w, h = make_scan(src, 46, text=PREFIX + line)
+        img = np.asarray(Image.open(src).convert("RGB"))
+        m = glyph_engine.measure(img, (x, y, x + w, y + h))
+        boxes, _note, seg = render_candidates.borrow_boxes(m, line, glyph_engine)
+        self.assertEqual(seg, "components")
+        space_after = [i + 1 < len(line) and line[i + 1].isspace() for i, c in enumerate(line) if not c.isspace()]
+        lib = glyph_engine.build_glyph_library(img, m, boxes, space_after=space_after)
+        fit = glyph_engine._advance_fit(FONT, lib)
+        self.assertIsNotNone(fit)
+        self.assertLess(abs(min(fit, key=fit.get) - 46.0), 1.0)
 
     def test_space_after_a_glyph_that_had_none_is_kept(self) -> None:
         # "5" occurs twice in the source, once before a blank and once glued to "月"; a blank typed
@@ -225,6 +273,15 @@ class PipelineTest(unittest.TestCase):
             return moon[0] - (five[0] + five[2])
 
         self.assertGreater(last_gap(info["_cand"]) - last_gap(src), 0.3 * 46)
+
+    def test_non_integer_page_blocks_export_and_is_recorded(self) -> None:
+        src = self.tmp / "badpage.jpg"
+        bbox = make_scan(src, 46)
+        info = self._render(src, bbox, DATE, NEW_DATE)
+        qa = self._export(src, info, bbox, DATE, NEW_DATE, page="abc")
+        self.assertNotEqual(qa["_rc"], 0)
+        manifest = (self.tmp / "out" / "manifest.json").read_text(encoding="utf-8")
+        self.assertIn('"abc"', manifest)
 
     def test_edit_on_a_missing_page_blocks_export(self) -> None:
         src = self.tmp / "page.jpg"
@@ -255,6 +312,80 @@ class PipelineTest(unittest.TestCase):
         failed = {"status": "fail", "read": "x", "expected": "y"}
         self.assertEqual(qa_gate._ocr_summary([skipped, failed])[2], "fail")
         self.assertEqual(qa_gate._ocr_summary([{"status": "pass"}])[2], "pass")
+
+    def test_gate_passes_the_untouched_source(self) -> None:
+        # the reference for ink is the replaced glyphs, so the source scored against itself is clean
+        import qa_gate
+        src = self.tmp / "self.jpg"
+        x, y, w, h = make_scan(src, 46)
+        res = qa_gate.run_gate(str(src), str(src), [{"bbox": (x, y, w, h), "region": (x, y, x + w, y + h),
+                                                     "expected_text": DATE}])
+        self.assertLess(res["metrics"]["ink_delta"], 0.5)
+        self.assertLess(res["metrics"]["ink_chroma_delta"], 0.5)
+
+    def test_ocr_vote_needs_a_majority(self) -> None:
+        import qa_gate
+        self.assertEqual(qa_gate._ocr_vote(["2025年", "2025征", "2025年"], "2025年"), "2025年")
+        self.assertEqual(qa_gate._ocr_vote(["2025征", "2025征", "2025年"], "2025年"), "2025征")
+
+    def test_replay_keeps_each_glyph_tone(self) -> None:
+        # rendering the source line from its own mattes must not re-tone any glyph
+        import qa_gate
+        src = self.tmp / "tone.jpg"
+        x, y, w, h = make_scan(src, 46)
+        info = self._render(src, (x, y, w, h), DATE, DATE)
+        s = np.asarray(Image.open(src).convert("RGB"))
+        o = np.asarray(Image.open(info["_cand"]).convert("RGB"))
+        win = (0, max(0, y - 8), s.shape[1], min(s.shape[0], y + h + 8))
+        box = (x, y, x + w, y + h)
+        tones = []
+        for img, pol in ((s, None), (o, -1)):
+            m = glyph_engine.measure(img, win, polarity=pol)
+            pool = qa_gate._split_wide(img, win, m, qa_gate._glyph_pool(m))
+            tones.append([float(g.get("ink_tone", g["ink_lum"])) for g in
+                          sorted((g for g in pool if qa_gate._centre_inside(g, box)), key=lambda g: g["box"][0])])
+        self.assertEqual(len(tones[0]), len(tones[1]))
+        self.assertLess(max(abs(a - b) for a, b in zip(*tones)), 3.0)
+
+    def test_gate_tells_digits_from_cjk(self) -> None:
+        import qa_gate
+        src = self.tmp / "kinds.jpg"
+        x, y, w, h = make_scan(src, 46)
+        s = np.asarray(Image.open(src).convert("RGB"))
+        win = (0, max(0, y - 8), s.shape[1], min(s.shape[0], y + h + 8))
+        m = glyph_engine.measure(s, win)
+        pool = qa_gate._classify(qa_gate._split_wide(s, win, m, qa_gate._glyph_pool(m)))
+        inside = sorted((g for g in pool if qa_gate._centre_inside(g, (x, y, x + w, y + h))), key=lambda g: g["box"][0])
+        kinds = "".join("d" if g["kind"] == "digit" else "c" for g in inside)
+        self.assertEqual(kinds, "ddddcddcddc")  # 2025年07月30日
+
+    def test_borrowed_glyphs_after_a_synthesized_one_keep_their_tone(self) -> None:
+        # a synthetic "8" has a fractional advance; the borrowed glyphs behind it must still be
+        # placed on whole pixels, not re-interpolated ("月"/"日" came out 4-6 levels lighter)
+        import qa_gate
+        src = self.tmp / "after.jpg"
+        x, y, w, h = make_scan(src, 46)
+        info = self._render(src, (x, y, w, h), DATE, NEW_DATE)
+        s = np.asarray(Image.open(src).convert("RGB"))
+        o = np.asarray(Image.open(info["_cand"]).convert("RGB"))
+        win = (0, max(0, y - 8), s.shape[1], min(s.shape[0], y + h + 8))
+        box = (x, y, x + w, y + h)
+
+        def tones(img, pol):
+            m = glyph_engine.measure(img, win, polarity=pol)
+            pool = qa_gate._classify(qa_gate._split_wide(img, win, m, qa_gate._glyph_pool(m)))
+            return [float(g["ink_tone"]) for g in sorted(
+                (g for g in pool if qa_gate._centre_inside(g, box) and g["kind"] != "fragment"),
+                key=lambda g: g["box"][0])]
+
+        src_t, out_t = tones(s, None), tones(o, -1)
+        self.assertEqual(len(out_t), len(NEW_DATE))
+        by_char: dict[str, list[float]] = {}
+        for ch, v in zip(DATE, src_t):
+            by_char.setdefault(ch, []).append(v)
+        for ch, v in zip(NEW_DATE, out_t):
+            if ch in by_char:
+                self.assertLess(abs(v - float(np.mean(by_char[ch]))), 3.0, ch)
 
     def test_default_font_is_found(self) -> None:
         # the synthesis / --legacy fallback font comes from the engine's cross-platform font folders

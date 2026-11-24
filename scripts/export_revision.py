@@ -585,7 +585,7 @@ def main() -> int:
     for index, edit in enumerate(edits, 1):
         box = edit_bbox(edit)
         region = union_bbox(box, edited_bbox)
-        regions.append({"index": index, "page": int(edit.get("page", 1) or 1), "bbox": list(box) if box else None,
+        regions.append({"index": index, "page": edit.get("page") if edit_page(edit) is None else edit_page(edit), "bbox": list(box) if box else None,
                         "region": [region[0], region[1], region[0] + region[2], region[1] + region[3]] if region else None,
                         "char_sources": char_sources(edit),
                         "hash_algorithm": "sha256/raw-rgb-crop",

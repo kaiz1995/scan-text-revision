@@ -419,13 +419,14 @@ def render_engine(image, box, text, engine, page_text, font_path, sigma, weight,
         metrics["sigma_source"] = "override"
     if weight is not None:
         metrics["font_weight_px"] = float(weight)
-    need_font = bool(synthesized or want_font_id or any(c.isspace() for c in render_text))
     if pen_x is None and not library.get(render_text[0]):
         # first glyph is synthesized: the engine would anchor it at the (margin-expanded)
         # measure; use the selected line's own left ink edge instead.
         pen_x = line_left_pen(engine, tight, metrics, render_text[0], font_path)
 
-    patch, ink_rgb = engine.render(render_text, metrics, library, font_path=font_path if need_font else None,
+    # a given or identified font is always passed: the engine may need it for blanks and for
+    # borrowed glyphs whose source advance does not fit the new text
+    patch, ink_rgb = engine.render(render_text, metrics, library, font_path=font_path,
                                    pen_x=None if pen_x is None else float(pen_x))
     patch = np.asarray(patch, np.float32)
     if patch.ndim > 2: patch = patch[..., 0]
@@ -453,7 +454,10 @@ def render_engine(image, box, text, engine, page_text, font_path, sigma, weight,
     if hasattr(engine, "noise_field"):
         try: ink_noise = engine.noise_field(metrics, patch.shape[:2])
         except Exception: ink_noise = None
-    composed = engine.compose(base, patch, ink_rgb, float(x0), float(y0), mask=mask, ink_noise=ink_noise)
+    # per-glyph ink (patch shaped) when the engine provides it, else the single colour
+    ink_field = metrics.get("ink_field")
+    ink_for_compose = ink_field if ink_field is not None and np.asarray(ink_field).shape[:2] == patch.shape[:2] else ink_rgb
+    composed = engine.compose(base, patch, ink_for_compose, float(x0), float(y0), mask=mask, ink_noise=ink_noise)
     result = _result_image(composed)
     if result.size != image.size: raise ValueError("compose() returned an image with changed dimensions")
     before, after = np.asarray(image), np.asarray(result)
@@ -476,7 +480,7 @@ def render_engine(image, box, text, engine, page_text, font_path, sigma, weight,
                      "b": round(float(metrics.get("baseline_b", 0.0)), 5),
                      "x0": round(float(metrics.get("baseline_x0", x0)), 3)},
         "roi": [x0, y0, x1, y1],
-        "font": font_path or metrics.get("font_path"),
+        "font": metrics.get("font_path") or font_path,
         "page_text": page_text,
         "measurement": {
             "glyph_components": len(metrics.get("glyphs") or []),

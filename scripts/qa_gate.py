@@ -9,8 +9,8 @@ metric              algorithm                                           threshol
 ==================  ==================================================  =========
 outside region      per-pixel |src-out| outside every declared region    max == 0
 boundary step       second difference of column/row means at the seams     < 1.0
-full-ink colour     glyph-core median luminance, vs neighbours             < 3
-ink chroma          CIELAB distance of the core ink, vs neighbours         < 3
+full-ink colour     glyph-core median luminance, vs replaced glyphs        < 3
+ink chroma          CIELAB distance of the core ink, vs replaced glyphs    < 3
 stroke width        distance-transform median * 2, vs neighbours          < 0.5 px
 glyph height        bbox height, digits vs digits / CJK vs matched CJK    < 1 px
 baseline            source digit baseline a+b*x, per new digit residual   < 1 px
@@ -321,7 +321,11 @@ def _classify(comps: list[dict]) -> list[dict]:
     """
     if not comps:
         return []
-    hs = sorted(float(g["box"][3]) for g in comps)
+    # fragments (dots, radicals cut off a CJK glyph) are neither class; left in, the
+    # largest height gap fell between them and the glyphs and every digit became "cjk"
+    full_h = max(float(g["box"][3]) for g in comps)
+    glyph_like = [g for g in comps if float(g["box"][3]) >= 0.5 * full_h]
+    hs = sorted(float(g["box"][3]) for g in glyph_like)
     max_h = hs[-1]
     gap = 0.0
     cut = 0.0
@@ -332,7 +336,9 @@ def _classify(comps: list[dict]) -> list[dict]:
     out = []
     for g in comps:
         w, h = float(g["box"][2]), float(g["box"][3])
-        if gap >= 3.0:
+        if h < 0.5 * full_h:
+            kind = "fragment"
+        elif gap >= 3.0:
             kind = "cjk" if h > cut else "digit"
         else:
             kind = "cjk" if (h >= 0.9 * max_h and w / max(h, 1.0) >= 0.72) else "digit"
@@ -566,6 +572,10 @@ def _has_cjk(text: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in text)
 
 
+# upscale factors the read-back is repeated at; the majority decides
+OCR_SCALES = (2, 3, 4)
+
+
 def _ocr_read(
     image: np.ndarray,
     bbox: tuple[int, int, int, int],
@@ -586,35 +596,58 @@ def _ocr_read(
     canvas = np.full((gray.shape[0] + 2 * pad, gray.shape[1] + 2 * pad),
                      int(np.median(border)), np.uint8)
     canvas[pad:pad + gray.shape[0], pad:pad + gray.shape[1]] = gray
-    im = Image.fromarray(canvas)
-    im = im.resize((im.width * 3, im.height * 3), Image.LANCZOS)
+    base = Image.fromarray(canvas)
     needs_cjk = _has_cjk(expected_text)
+    langs = ("chi_sim+eng",) if needs_cjk else ("chi_sim+eng", "eng")
+    last_err = ""
     with tempfile.TemporaryDirectory() as tmp:
-        png = Path(tmp) / "crop.png"
-        im.save(png)
-        langs = ("chi_sim+eng",) if needs_cjk else ("chi_sim+eng", "eng")
-        last_err = ""
         for lang in langs:
-            try:
-                res = subprocess.run(
-                    [exe, str(png), "stdout", "-l", lang, "--psm", "7"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=60,
-                )
-            except (OSError, subprocess.SubprocessError) as exc:
-                return None, f"tesseract failed: {exc}"
-            if res.returncode != 0:
-                last_err = (res.stderr or "").strip()[-300:] or f"exit code {res.returncode}"
+            reads: list[str] = []
+            failed = False
+            for scale in OCR_SCALES:
+                png = Path(tmp) / f"crop{scale}.png"
+                base.resize((base.width * scale, base.height * scale), Image.LANCZOS).save(png)
+                try:
+                    res = subprocess.run(
+                        [exe, str(png), "stdout", "-l", lang, "--psm", "7"],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=60,
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    return None, f"tesseract failed: {exc}"
+                if res.returncode != 0:
+                    last_err = (res.stderr or "").strip()[-300:] or f"exit code {res.returncode}"
+                    failed = True
+                    break
+                reads.append(res.stdout.strip())
+            if failed:
                 if needs_cjk:
                     if "chi_sim" in last_err or "Failed loading language" in last_err:
                         return None, "未安装 chi_sim 语言包"
                     return None, f"tesseract failed: {last_err}"
                 continue
-            return res.stdout.strip(), None
+            return _ocr_vote(reads, expected_text), None
     return None, f"tesseract failed for every language pack: {last_err}"
+
+
+def _ocr_vote(reads: list[str], expected_text: str) -> str:
+    """One read-back out of the reads at every ``OCR_SCALES`` scale.
+
+    Tesseract flips single glyphs between scales on clean text (a correct "年" read
+    as "征" at 3x only), while a wrong glyph is misread at every scale.  The
+    expected text wins when a majority of the reads equals it; otherwise the most
+    common read is reported, so a real error still fails.
+    """
+    from collections import Counter
+    norm = [_normalise_text(r) for r in reads]
+    want = _normalise_text(expected_text)
+    if 2 * sum(n == want for n in norm) > len(norm):
+        return next(r for r, n in zip(reads, norm) if n == want)
+    top = Counter(norm).most_common(1)[0][0]
+    return next(r for r, n in zip(reads, norm) if n == top)
 
 
 def _ocr_summary(results: list[dict]) -> tuple[Any, str, str, str | None]:
@@ -752,6 +785,11 @@ def run_gate(source_path: str, output_path: str, edits: list[dict]) -> dict:
         new_cjk = [g for g in new_comps if g["kind"] == "cjk"]
         stats_new = _comp_stats(new_comps, min_n=1)
         stats_ref = _comp_stats(ref_comps, min_n=2)
+        # ink is compared with the glyphs being replaced: neighbours outside the region
+        # can be a different run of the same ink (an untouched source scored 5.0 against
+        # its own neighbours); they remain the fallback when the region held no glyph
+        stats_old = _comp_stats([g for g in src_pool if _centre_inside(g, region)], min_n=1)
+        ink_ref = stats_old or stats_ref
         detail = {
             "index": idx,
             "bbox": list(bbox),
@@ -771,10 +809,10 @@ def run_gate(source_path: str, output_path: str, edits: list[dict]) -> dict:
             "noise_ratio": None,
         }
         if stats_new and stats_ref:
-            ink_d = abs(stats_new["ink"] - stats_ref["ink"])
+            ink_d = abs(stats_new["ink"] - ink_ref["ink"])
             stroke_d = abs(stats_new["stroke"] - stats_ref["stroke"])
             chroma_d = float(
-                np.linalg.norm(_rgb_to_lab(stats_new["ink_rgb"]) - _rgb_to_lab(stats_ref["ink_rgb"]))
+                np.linalg.norm(_rgb_to_lab(stats_new["ink_rgb"]) - _rgb_to_lab(ink_ref["ink_rgb"]))
             )
             ink_deltas.append(ink_d)
             chroma_deltas.append(chroma_d)
@@ -785,9 +823,10 @@ def run_gate(source_path: str, output_path: str, edits: list[dict]) -> dict:
                     "ink_chroma_delta": round(chroma_d, 3),
                     "stroke_delta": round(stroke_d, 3),
                     "ink_new": round(stats_new["ink"], 2),
-                    "ink_ref": round(stats_ref["ink"], 2),
+                    "ink_ref": round(ink_ref["ink"], 2),
+                    "ink_ref_source": "replaced" if stats_old else "neighbours",
                     "ink_rgb_new": [round(float(v), 1) for v in stats_new["ink_rgb"]],
-                    "ink_rgb_ref": [round(float(v), 1) for v in stats_ref["ink_rgb"]],
+                    "ink_rgb_ref": [round(float(v), 1) for v in ink_ref["ink_rgb"]],
                     "stroke_new": round(stats_new["stroke"], 2),
                     "stroke_ref": round(stats_ref["stroke"], 2),
                 }

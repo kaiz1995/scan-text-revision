@@ -3,6 +3,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Codex Skill](https://img.shields.io/badge/Codex-Skill-green.svg)](https://github.com/openai/codex)
+[![Version](https://img.shields.io/badge/version-v1.0.0-blue.svg)](#变更记录)
+
+当前版本 **v1.0.0**（2026-11-24）。装指定版本用
+`git clone --branch v1.0.0 https://github.com/kaiz1995/scan-text-revision.git <skills>/scan-text-revision`。
 
 在扫描件、手机拍摄的文档/屏幕照片、或只有图像层的 PDF 上，替换**用户框选的一行文字**。
 
@@ -294,6 +298,24 @@ python scripts/cloud_inpaint.py crop.png mask.png \
 7. **云端适配器的色彩校正、接缝羽化、官方参数枚举对齐**：未实现。
 8. **框选 GUI 的放大镜、多框、并排对比**：`selector.html` 仍是单框（该文件未改动）。
 9. **PSF 的完整 erf 拟合**：当前 `_estimate_sigma` 用 alpha 0.5 交叉处的最大梯度估计 σ（σ = 0.3989 / max|dA/dx|），不是最小二乘曲线拟合。
+
+## 变更记录
+
+### v1.0.0 — 2026-11-24
+
+首个打了 tag 的发布。README 里描述的能力在这一版都有对应代码与门禁：
+
+- **测量驱动的引擎**：逐通道二次曲面背景、按字色方向取墨色（深墨/浅墨都测）、逐字 alpha 覆盖度、整像素落位、基线 `y = a + b·x` 拟合、按真实 side bearing 借用原字形；小字（笔画 < 1 px）单独拟合 σ 与字重。
+- **缺字合成**：模板匹配识别字体/字号/字重，4× 超采样渲染后降采样；只有借不到的字才走合成。
+- **12 项强制门禁**（`scripts/qa_gate.py`）：选区外像素 ×2、接缝台阶、满墨色亮度、CIELAB 色差、笔画宽、字高、数字基线、CJK 基线偏移、噪声、JPEG 量化表、OCR 回读；字高与基线按「数字对数字、CJK 对同形状 CJK」分类比较。
+- **编码与容器保真**：JPEG 复用源量化表/子采样/渐进标志/DPI；PDF 有 `pikepdf` 时只替换页面图像 XObject，缺失时显式记 `lossy_fallback`。
+- **验证**：`tests/test_pipeline.py` 共 26 条，CI 两条腿（装 OpenCV / 仅 numpy）都通过。
+
+这一版仍是单框、单候选，也没有版面分析与二值扫描件分支，见上面 Roadmap。
+
+### 更早
+
+`c34d3e4` 初始发布；`f9aff2e` 起改为测量驱动引擎。更早版本的文档承诺与实现不一致，不要按版本引用。
 
 ## 许可证
 
